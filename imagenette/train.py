@@ -25,7 +25,7 @@ from torchvision.ops import MLP
 from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from epiplexity import Reservoir, epiplexity  # noqa: E402
+from epiplexity import Reservoir, PretrainedReservoir, epiplexity  # noqa: E402
 
 
 # ---------------------------------------------------------------- theirs, verbatim
@@ -103,6 +103,8 @@ def main():
     p.add_argument("--lr", type=float, default=2e-3); p.add_argument("--bs", type=int, default=256)
     p.add_argument("--epochs", type=int, default=800); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
+    p.add_argument("--reservoir", choices=["random", "pretrained"], default="random",
+                   help="random: frozen random CNN (theirs); pretrained: frozen ImageNet ResNet (PoC #1)")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
     a = p.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
@@ -117,7 +119,13 @@ def main():
     if a.grad_ckpt: net.backbone.set_grad_checkpointing(True)
     probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 10)).cuda()
     sigreg = SIGReg().cuda()
-    reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval() if a.method == "epi" else None
+    if a.method == "epi":
+        if a.reservoir == "pretrained":
+            reservoir = PretrainedReservoir(a.width, 4000 + a.seed).cuda().eval()
+        else:
+            reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
+    else:
+        reservoir = None
     opt = torch.optim.AdamW([{"params": net.parameters(), "lr": a.lr, "weight_decay": 5e-2},
                              {"params": probe.parameters(), "lr": 1e-3, "weight_decay": 1e-7}])
     warmup, total = len(train), len(train) * a.epochs

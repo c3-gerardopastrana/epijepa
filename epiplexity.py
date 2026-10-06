@@ -40,6 +40,41 @@ class Reservoir(nn.Module):
         return self.net(x)
 
 
+class PretrainedReservoir(nn.Module):
+    """Frozen *pretrained* CNN ruler (PoC #1).
+
+    Drop-in replacement for `Reservoir` with the identical contract: takes the
+    already-ImageNet-normalised image batch the training pipeline feeds and returns
+    `[batch, width]` features. We keep an early slice of a pretrained ResNet (through
+    `layer2`), global-average-pool it, then apply a fixed seeded random linear projection
+    to `width`. Using an early block keeps the ruler a generic feature extractor rather
+    than an ImageNet-class detector, which is the fair test of a stronger fixed ruler.
+
+    Everything downstream (standardisation in `ridge_map`, the ridge solve, the log-det
+    score, and the S0 calibration) is unchanged, so this isolates ruler *quality*.
+    """
+
+    def __init__(self, width, seed, arch="resnet18"):
+        super().__init__()
+        import torchvision
+        weights = {"resnet18": torchvision.models.ResNet18_Weights.IMAGENET1K_V1,
+                   "resnet34": torchvision.models.ResNet34_Weights.IMAGENET1K_V1}[arch]
+        backbone = getattr(torchvision.models, arch)(weights=weights)
+        # conv1, bn1, relu, maxpool, layer1, layer2  -> 128 channels for resnet18/34
+        self.body = nn.Sequential(*list(backbone.children())[:6])
+        feat_ch = 128
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        with torch.random.fork_rng():
+            torch.manual_seed(seed)
+            self.proj = nn.Linear(feat_ch, width)
+        self.requires_grad_(False)
+        self.eval()
+
+    def forward(self, x):
+        h = self.pool(self.body(x)).flatten(1)
+        return self.proj(h)
+
+
 def ridge_map(h, lam=RIDGE):
     """(H^T H + lam I)^-1 H^T on standardised features, via QR. Shape [features, batch]."""
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
