@@ -51,16 +51,22 @@ class SIGReg(torch.nn.Module):
 
 
 class ViTEncoder(nn.Module):
-    def __init__(self, proj_dim=128):
+    def __init__(self, proj_dim=128, embed_bn=True):
         super().__init__()
         self.backbone = timm.create_model("vit_small_patch8_224", pretrained=False, num_classes=512,
                                           drop_path_rate=0.1, img_size=128)
         self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d)
+        # Non-affine BatchNorm on the projector output: the standard "BN before the loss"
+        # head. It pins the embedding scale (no learnable gain/shift) so the epiplexity
+        # log-det score cannot be inflated by magnitude, matching the repo's CIFAR/EpiWM
+        # recipe. The probe reads `emb` (pre-projector), so probe space stays separate.
+        self.embed_bn = nn.BatchNorm1d(proj_dim, affine=False) if embed_bn else nn.Identity()
 
     def forward(self, x):
         N, V = x.shape[:2]
         emb = self.backbone(x.flatten(0, 1))
-        return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
+        proj = self.embed_bn(self.proj(emb))
+        return emb, proj.reshape(N, V, -1).transpose(0, 1)
 
 
 NORM = v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -106,7 +112,16 @@ def main():
     p.add_argument("--reservoir", choices=["random", "pretrained"], default="random",
                    help="random: frozen random CNN (theirs); pretrained: frozen ImageNet ResNet (PoC #1)")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
+    p.add_argument("--embed_bn", action="store_true", default=True,
+                   help="non-affine BatchNorm on the projector output before the loss (default on)")
+    p.add_argument("--no_embed_bn", dest="embed_bn", action="store_false",
+                   help="disable the projector-output BatchNorm (original LeJEPA chassis behaviour)")
     a = p.parse_args()
+    # SIGReg's Gaussian target already specifies a scale, so it must see raw projector
+    # outputs; the BN head is only meaningful for the epiplexity/align arms.
+    if a.method == "sigreg" and a.embed_bn:
+        a.embed_bn = False
+        print("note: --embed_bn disabled for method=sigreg (it needs raw projector scale)", flush=True)
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     ck, res = out / "checkpoint.pt", out / "result.json"
     if res.exists():
@@ -115,7 +130,7 @@ def main():
     train_ds, test_ds = Views(a.data, "train", V=a.V), Views(a.data, "val", V=1)
     train = DataLoader(train_ds, batch_size=a.bs, shuffle=True, drop_last=True, num_workers=a.workers, pin_memory=True, persistent_workers=True)
     test = DataLoader(test_ds, batch_size=256, num_workers=4, pin_memory=True, persistent_workers=True)
-    net = ViTEncoder(proj_dim=a.proj_dim).cuda()
+    net = ViTEncoder(proj_dim=a.proj_dim, embed_bn=a.embed_bn).cuda()
     if a.grad_ckpt: net.backbone.set_grad_checkpointing(True)
     probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 10)).cuda()
     sigreg = SIGReg().cuda()
@@ -184,7 +199,8 @@ def main():
         print(f"{a.method} lamb={a.lamb:g} seed={a.seed}: {epoch + 1}/{a.epochs} acc={log['test_acc'] * 100:.2f}% "
               f"inv={log['inv']:.4f} reg={log['reg']:.4f} {log['seconds']:.0f}s", flush=True)
     best = max(h["test_acc"] for h in hist)
-    res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, final_acc=hist[-1]["test_acc"], best_acc=best,
+    res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
+                                   embed_bn=a.embed_bn, final_acc=hist[-1]["test_acc"], best_acc=best,
                                    epochs=a.epochs, history=hist), indent=1))
     print(f"FINAL {a.method} lamb={a.lamb:g} seed={a.seed}: final {hist[-1]['test_acc'] * 100:.2f}%  best {best * 100:.2f}%", flush=True)
 
