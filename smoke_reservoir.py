@@ -13,7 +13,7 @@ Run:  python smoke_reservoir.py
 """
 import torch
 
-from epiplexity import Reservoir, PretrainedReservoir, epiplexity
+from epiplexity import Reservoir, PretrainedReservoir, ReconReservoir, epiplexity
 
 DEVICE = "cpu"  # ridge/score run in float64; MPS lacks float64, real training uses CUDA
 WIDTH, PROJ_DIM, BATCH = 64, 16, 32
@@ -50,4 +50,24 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     check("random Reservoir", Reservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)))
     check("PretrainedReservoir", PretrainedReservoir(WIDTH, 4000))
-    print("OK: both reservoirs satisfy the score contract (collapse->0, informative->positive).")
+
+    # recon_online ruler: forward contract + a recon step runs and is finite
+    recon = ReconReservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)).to(DEVICE)
+    check("ReconReservoir(fwd)", recon)
+    xr = torch.randn(BATCH, 3, 128, 128, device=DEVICE)
+    rl = recon.recon_loss(xr); rl.backward()
+    assert torch.isfinite(rl), f"recon loss non-finite {rl}"
+    print(f"      ReconReservoir: recon_loss={float(rl):.4f} grad_ok=True")
+
+    # reseed: random reservoir weights change after reseed, contract preserved
+    r = Reservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)).to(DEVICE)
+    x = torch.randn(BATCH, 3, 128, 128, device=DEVICE)
+    with torch.no_grad():
+        before = r(x).clone()
+        r.reseed(9999)
+        after = r(x)
+    assert after.shape == before.shape, "reseed changed output shape"
+    assert (before - after).abs().max() > 1e-4, "reseed did not change the reservoir"
+    print("      Reservoir.reseed: output changed after reseed, shape preserved")
+
+    print("OK: all reservoirs satisfy the score contract.")

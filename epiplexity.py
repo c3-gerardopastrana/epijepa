@@ -39,6 +39,19 @@ class Reservoir(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+    @torch.no_grad()
+    def reseed(self, seed):
+        """Re-draw all weights from a fresh seed, in place (for --reservoir random_resample).
+
+        Encoder-independent: new weights depend only on `seed`, never on the encoder, so
+        this cannot create the collusion failure mode. Stays frozen (no_grad)."""
+        with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+            torch.manual_seed(seed)
+            for m in self.net:
+                if isinstance(m, (nn.Conv2d, nn.Linear)):
+                    m.reset_parameters()
+        self.requires_grad_(False)
+
 
 class PretrainedReservoir(nn.Module):
     """Frozen *pretrained* CNN ruler (PoC #1).
@@ -73,6 +86,39 @@ class PretrainedReservoir(nn.Module):
     def forward(self, x):
         h = self.pool(self.body(x)).flatten(1)
         return self.proj(h)
+
+
+class ReconReservoir(nn.Module):
+    """Reservoir whose encoder is the SAME random-CNN architecture as `Reservoir`, but
+    trained ONLINE to reconstruct the input frames (its own decoder + MSE recon loss).
+
+    The epiplexity score reads `forward(x)` under no_grad (see `epiplexity`), so the score
+    never shapes this ruler -- only reconstruction does. That keeps the ruler
+    encoder-independent (no collusion). Step `recon_loss(x)` with its own optimiser each
+    step; use `forward(x)` for the (read-time frozen) features fed to the ridge/score.
+    """
+
+    def __init__(self, width, seed, channels=(16, 32, 64, 64)):
+        super().__init__()
+        self.encoder = Reservoir(width, seed, channels)
+        self.encoder.requires_grad_(True)  # this ruler IS trained, by reconstruction
+        self.dec_ch = channels[-1]
+        self.dec_fc = nn.Linear(width, channels[-1] * 16)  # -> 4x4 map
+        ups, inc = [], channels[-1]
+        for c in (64, 32, 16, 8):
+            ups += [nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(inc, c, 3, 1, 1), ChannelNorm(), nn.ELU()]
+            inc = c
+        self.decoder = nn.Sequential(*ups, nn.Conv2d(inc, 3, 3, 1, 1))
+
+    def forward(self, x):
+        return self.encoder(x)
+
+    def recon_loss(self, x):
+        z = self.encoder(x)
+        h = self.dec_fc(z).reshape(z.shape[0], self.dec_ch, 4, 4)
+        xhat = F.interpolate(self.decoder(h), size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return F.mse_loss(xhat, x)
 
 
 def ridge_map(h, lam=RIDGE):

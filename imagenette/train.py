@@ -25,7 +25,7 @@ from torchvision.ops import MLP
 from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from epiplexity import Reservoir, PretrainedReservoir, epiplexity  # noqa: E402
+from epiplexity import Reservoir, PretrainedReservoir, ReconReservoir, epiplexity  # noqa: E402
 
 
 # ---------------------------------------------------------------- theirs, verbatim
@@ -109,8 +109,13 @@ def main():
     p.add_argument("--lr", type=float, default=2e-3); p.add_argument("--bs", type=int, default=256)
     p.add_argument("--epochs", type=int, default=800); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
-    p.add_argument("--reservoir", choices=["random", "pretrained"], default="random",
-                   help="random: frozen random CNN (theirs); pretrained: frozen ImageNet ResNet (PoC #1)")
+    p.add_argument("--reservoir", choices=["random", "pretrained", "recon_online", "random_resample"], default="random",
+                   help="random: frozen random CNN (theirs); pretrained: frozen ImageNet ResNet; "
+                        "recon_online: random-CNN ruler trained online to reconstruct frames; "
+                        "random_resample: fresh random weights every --resample_every epochs")
+    p.add_argument("--resample_every", type=int, default=2,
+                   help="for random_resample: epochs between fresh-random reservoir redraws")
+    p.add_argument("--recon_lr", type=float, default=1e-3, help="for recon_online: ruler reconstruction LR")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
     p.add_argument("--embed_bn", action="store_true", default=True,
                    help="non-affine BatchNorm on the projector output before the loss (default on)")
@@ -134,10 +139,14 @@ def main():
     if a.grad_ckpt: net.backbone.set_grad_checkpointing(True)
     probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 10)).cuda()
     sigreg = SIGReg().cuda()
+    recon_opt = None
     if a.method == "epi":
         if a.reservoir == "pretrained":
             reservoir = PretrainedReservoir(a.width, 4000 + a.seed).cuda().eval()
-        else:
+        elif a.reservoir == "recon_online":
+            reservoir = ReconReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda()
+            recon_opt = torch.optim.AdamW(reservoir.parameters(), lr=a.recon_lr, weight_decay=1e-4)
+        else:  # random or random_resample
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
         reservoir = None
@@ -151,8 +160,7 @@ def main():
     def views_score(proj, vs):
         return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir) for v in range(a.V)]).mean()
 
-    s0, start, hist = 1., 0, []
-    if a.method == "epi":  # one-off scale calibration, same role as their loss normalisation
+    def calibrate_s0():
         with torch.no_grad():
             vals = []
             for i, (vs, _) in enumerate(train):
@@ -160,19 +168,40 @@ def main():
                 with autocast("cuda", dtype=torch.bfloat16): _, pr = net(vs)
                 vals.append(float(views_score(pr, vs)))
                 if i >= 3: break
-            s0 = max(sum(vals) / len(vals), 1e-8)
+            return max(sum(vals) / len(vals), 1e-8)
+
+    s0, start, hist = 1., 0, []
+    if a.method == "epi":  # one-off scale calibration, same role as their loss normalisation
+        s0 = calibrate_s0()
         print(f"S0={s0:.2f}", flush=True)
     if ck.exists():
         st = torch.load(ck, map_location="cuda", weights_only=False)
         net.load_state_dict(st["net"]); probe.load_state_dict(st["probe"]); opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"]); scaler.load_state_dict(st["scaler"])
         start, hist, s0 = st["epoch"], st["hist"], st["s0"]
+        if "reservoir" in st and reservoir is not None:
+            reservoir.load_state_dict(st["reservoir"])
+        if "recon_opt" in st and recon_opt is not None:
+            recon_opt.load_state_dict(st["recon_opt"])
         print(f"resumed at epoch {start}", flush=True)
 
     for epoch in range(start, a.epochs):
+        # random_resample: redraw the frozen ruler every --resample_every epochs, then
+        # recalibrate S0 so the normalised score keeps the same meaning.
+        if a.reservoir == "random_resample" and epoch > 0 and epoch % a.resample_every == 0:
+            reservoir.reseed(4000 + a.seed + epoch)
+            s0 = calibrate_s0()
+            print(f"resampled reservoir @ epoch {epoch}, S0={s0:.2f}", flush=True)
         net.train(); probe.train(); t0 = time.perf_counter(); agg = {}
         for vs, y in train:
             vs, y = vs.cuda(non_blocking=True), y.cuda(non_blocking=True)
+            # recon_online: train the ruler to reconstruct frames (its own optimiser);
+            # stop-grad from the score keeps it encoder-independent.
+            if recon_opt is not None:
+                reservoir.train()
+                rl = reservoir.recon_loss(vs[:, 0].float())
+                recon_opt.zero_grad(); rl.backward(); recon_opt.step()
+                agg["recon"] = agg.get("recon", 0.) + float(rl.detach())
             with autocast("cuda", dtype=torch.bfloat16):
                 emb, proj = net(vs)
                 inv_loss = (proj.mean(0) - proj).square().mean()
@@ -193,8 +222,13 @@ def main():
                     correct += (probe(net(vs.cuda(non_blocking=True))[0]).argmax(1) == y.cuda()).sum().item()
         log.update(epoch=epoch + 1, test_acc=correct / len(test_ds), seconds=time.perf_counter() - t0)
         hist.append(log)
-        torch.save(dict(net=net.state_dict(), probe=probe.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
-                        scaler=scaler.state_dict(), epoch=epoch + 1, hist=hist, s0=s0), ck)
+        ckpt = dict(net=net.state_dict(), probe=probe.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
+                    scaler=scaler.state_dict(), epoch=epoch + 1, hist=hist, s0=s0)
+        if a.reservoir in ("recon_online", "random_resample"):
+            ckpt["reservoir"] = reservoir.state_dict()
+        if recon_opt is not None:
+            ckpt["recon_opt"] = recon_opt.state_dict()
+        torch.save(ckpt, ck)
         (out / "history.json").write_text(json.dumps(hist))
         print(f"{a.method} lamb={a.lamb:g} seed={a.seed}: {epoch + 1}/{a.epochs} acc={log['test_acc'] * 100:.2f}% "
               f"inv={log['inv']:.4f} reg={log['reg']:.4f} {log['seconds']:.0f}s", flush=True)
