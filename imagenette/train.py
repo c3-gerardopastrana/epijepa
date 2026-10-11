@@ -25,7 +25,8 @@ from torchvision.ops import MLP
 from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from epiplexity import Reservoir, PretrainedReservoir, ReconReservoir, epiplexity  # noqa: E402
+from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
+                        MultiReservoir, epiplexity)
 
 
 # ---------------------------------------------------------------- theirs, verbatim
@@ -109,13 +110,23 @@ def main():
     p.add_argument("--lr", type=float, default=2e-3); p.add_argument("--bs", type=int, default=256)
     p.add_argument("--epochs", type=int, default=800); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
-    p.add_argument("--reservoir", choices=["random", "pretrained", "recon_online", "random_resample"], default="random",
-                   help="random: frozen random CNN (theirs); pretrained: frozen ImageNet ResNet; "
-                        "recon_online: random-CNN ruler trained online to reconstruct frames; "
-                        "random_resample: fresh random weights every --resample_every epochs")
+    p.add_argument("--reservoir",
+                   choices=["random", "pretrained", "recon_online", "random_resample",
+                            "rff", "multi_random", "random_drift"],
+                   default="random",
+                   help="random/pretrained/recon_online/random_resample as before; "
+                        "rff: random Fourier features on a random-CNN descriptor; "
+                        "multi_random: K random CNNs (see --K, --multi_agg); "
+                        "random_drift: OU slow-drift random CNN (see --drift_alpha)")
     p.add_argument("--resample_every", type=int, default=2,
                    help="for random_resample: epochs between fresh-random reservoir redraws")
     p.add_argument("--recon_lr", type=float, default=1e-3, help="for recon_online: ruler reconstruction LR")
+    p.add_argument("--direction", choices=["feat2z", "z2feat"], default="feat2z",
+                   help="feat2z: features->z (original); z2feat: z->features (linear-sufficiency reframe)")
+    p.add_argument("--multi_agg", choices=["stack", "mean"], default="stack",
+                   help="for multi_random: stack (concat->one log-det) or mean (avg K scores)")
+    p.add_argument("--K", type=int, default=4, help="number of random CNNs for multi_random")
+    p.add_argument("--drift_alpha", type=float, default=0.1, help="OU drift rate for random_drift (per epoch)")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
     p.add_argument("--embed_bn", action="store_true", default=True,
                    help="non-affine BatchNorm on the projector output before the loss (default on)")
@@ -146,7 +157,11 @@ def main():
         elif a.reservoir == "recon_online":
             reservoir = ReconReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda()
             recon_opt = torch.optim.AdamW(reservoir.parameters(), lr=a.recon_lr, weight_decay=1e-4)
-        else:  # random or random_resample
+        elif a.reservoir == "rff":
+            reservoir = RFFReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
+        elif a.reservoir == "multi_random":
+            reservoir = MultiReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
+        else:  # random, random_resample, random_drift
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
         reservoir = None
@@ -158,7 +173,9 @@ def main():
     scaler = GradScaler()
 
     def views_score(proj, vs):
-        return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir) for v in range(a.V)]).mean()
+        return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir,
+                                       direction=a.direction, multi_agg=a.multi_agg)
+                            for v in range(a.V)]).mean()
 
     def calibrate_s0():
         with torch.no_grad():
@@ -192,6 +209,9 @@ def main():
             reservoir.reseed(4000 + a.seed + epoch)
             s0 = calibrate_s0()
             print(f"resampled reservoir @ epoch {epoch}, S0={s0:.2f}", flush=True)
+        if a.reservoir == "random_drift" and epoch > 0:
+            reservoir.drift(4000 + a.seed + epoch, a.drift_alpha)
+            s0 = calibrate_s0()
         net.train(); probe.train(); t0 = time.perf_counter(); agg = {}
         for vs, y in train:
             vs, y = vs.cuda(non_blocking=True), y.cuda(non_blocking=True)
@@ -224,7 +244,7 @@ def main():
         hist.append(log)
         ckpt = dict(net=net.state_dict(), probe=probe.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
                     scaler=scaler.state_dict(), epoch=epoch + 1, hist=hist, s0=s0)
-        if a.reservoir in ("recon_online", "random_resample"):
+        if a.reservoir in ("recon_online", "random_resample", "random_drift"):
             ckpt["reservoir"] = reservoir.state_dict()
         if recon_opt is not None:
             ckpt["recon_opt"] = recon_opt.state_dict()
@@ -234,7 +254,8 @@ def main():
               f"inv={log['inv']:.4f} reg={log['reg']:.4f} {log['seconds']:.0f}s", flush=True)
     best = max(h["test_acc"] for h in hist)
     res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
-                                   embed_bn=a.embed_bn, final_acc=hist[-1]["test_acc"], best_acc=best,
+                                   embed_bn=a.embed_bn, direction=a.direction, multi_agg=a.multi_agg,
+                                   K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
                                    epochs=a.epochs, history=hist), indent=1))
     print(f"FINAL {a.method} lamb={a.lamb:g} seed={a.seed}: final {hist[-1]['test_acc'] * 100:.2f}%  best {best * 100:.2f}%", flush=True)
 

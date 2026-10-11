@@ -13,7 +13,8 @@ Run:  python smoke_reservoir.py
 """
 import torch
 
-from epiplexity import Reservoir, PretrainedReservoir, ReconReservoir, epiplexity
+from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,
+                        MultiReservoir, epiplexity)
 
 DEVICE = "cpu"  # ridge/score run in float64; MPS lacks float64, real training uses CUDA
 WIDTH, PROJ_DIM, BATCH = 64, 16, 32
@@ -69,5 +70,26 @@ if __name__ == "__main__":
     assert after.shape == before.shape, "reseed changed output shape"
     assert (before - after).abs().max() > 1e-4, "reseed did not change the reservoir"
     print("      Reservoir.reseed: output changed after reseed, shape preserved")
+
+    # RFF ruler: contract + collapse->0, informative>0
+    check("RFFReservoir", RFFReservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)))
+
+    # multi_random: stack and mean aggregation both finite & differentiable
+    multi = MultiReservoir(WIDTH, 4000, K=4, channels=(16, 32, 64, 64, 128, 128)).to(DEVICE)
+    xm = torch.randn(BATCH, 3, 128, 128, device=DEVICE)
+    for agg in ("stack", "mean"):
+        z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
+        s = epiplexity(z, xm, multi, direction="feat2z", multi_agg=agg); s.backward()
+        assert torch.isfinite(s) and z.grad is not None
+        print(f"      multi_random({agg}): score={float(s):8.4f} grad_ok=True")
+
+    # direction flip z2feat on a single random ruler
+    r2 = Reservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)).to(DEVICE)
+    z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
+    s = epiplexity(z, xm, r2, direction="z2feat"); s.backward()
+    zc = torch.ones(BATCH, PROJ_DIM, device=DEVICE)
+    collapsed = float(epiplexity(zc, xm, r2, direction="z2feat"))
+    assert torch.isfinite(s) and abs(collapsed) < 1e-3, f"z2feat: collapse should be 0, got {collapsed}"
+    print(f"      z2feat direction: informative={float(s):8.4f} collapsed={collapsed:8.4f} grad_ok=True")
 
     print("OK: all reservoirs satisfy the score contract.")

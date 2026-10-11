@@ -52,6 +52,19 @@ class Reservoir(nn.Module):
                     m.reset_parameters()
         self.requires_grad_(False)
 
+    @torch.no_grad()
+    def drift(self, seed, alpha):
+        """OU drift toward fresh random weights: w <- sqrt(1-a) w + sqrt(a) w_new.
+
+        Keeps the weight variance stationary (same init distribution), so the ruler moves
+        smoothly without shrinking or drifting off-distribution. Encoder-independent."""
+        fresh = Reservoir(self.net[-1].out_features, seed,
+                          tuple(m.out_channels for m in self.net if isinstance(m, nn.Conv2d))).to(
+                              next(self.parameters()).device)
+        for p, q in zip(self.parameters(), fresh.parameters()):
+            p.mul_(math.sqrt(1 - alpha)).add_(q, alpha=math.sqrt(alpha))
+        self.requires_grad_(False)
+
 
 class PretrainedReservoir(nn.Module):
     """Frozen *pretrained* CNN ruler (PoC #1).
@@ -121,6 +134,51 @@ class ReconReservoir(nn.Module):
         return F.mse_loss(xhat, x)
 
 
+class RFFReservoir(nn.Module):
+    """Random Fourier Features on top of a frozen random-CNN descriptor.
+
+    phi(u) = sqrt(2/D) cos(Omega u + b), with Omega drawn at a MIXTURE of bandwidths so
+    the ruler covers multiple length-scales (local+global). This is an unbiased estimator
+    of an RBF-kernel feature map (Rahimi & Recht 2007) in the random-CNN descriptor space,
+    which is why it's a principled random ruler rather than an arbitrary one.
+    """
+
+    def __init__(self, width, seed, channels=(16, 32, 64, 64), bandwidths=(0.5, 1.0, 2.0, 4.0)):
+        super().__init__()
+        self.backbone = Reservoir(width, seed, channels)   # frozen random-CNN descriptor u
+        D_per = max(width // len(bandwidths), 1)
+        with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+            torch.manual_seed(seed + 1)
+            omegas, biases, scales = [], [], []
+            for i, sigma in enumerate(bandwidths):
+                omegas.append(torch.randn(width, D_per) / sigma)      # N(0, 1/sigma^2)
+                biases.append(torch.rand(D_per) * 2 * math.pi)
+                scales.append(sigma)
+            self.register_buffer("omega", torch.cat(omegas, dim=1))   # [width, D]
+            self.register_buffer("bias", torch.cat(biases))           # [D]
+        self.D = self.omega.shape[1]
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        u = self.backbone(x)                                          # [N, width]
+        proj = u @ self.omega + self.bias                             # [N, D]
+        return math.sqrt(2.0 / self.D) * torch.cos(proj)
+
+
+class MultiReservoir(nn.Module):
+    """K independent random-CNN reservoirs. Returns a LIST of K feature sets; the score
+    aggregates them by 'stack' (concat -> one log-det, rewards diversity) or 'mean'
+    (average K scores -> Monte-Carlo estimate of E_R[S])."""
+
+    def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64)):
+        super().__init__()
+        self.nets = nn.ModuleList([Reservoir(width, seed + 100 * k, channels) for k in range(K)])
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        return [net(x) for net in self.nets]
+
+
 def ridge_map(h, lam=RIDGE):
     """(H^T H + lam I)^-1 H^T on standardised features, via QR. Shape [features, batch]."""
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
@@ -136,8 +194,40 @@ def score(z, a, eta=ETA):
     return 0.5 * torch.linalg.slogdet(eye + eta * w.T @ w)[1] / math.log(2)
 
 
-def epiplexity(z, x, reservoir):
-    """Score of embedding z (differentiable) against the frozen reservoir's view of images x."""
+def score_z2feat(z, h, eta=ETA, lam=RIDGE):
+    """Flipped direction (Axis D): z is the REGRESSOR, random features h the TARGET.
+
+    W = (Z^T Z + rho I)^-1 Z^T H_c  -- 'how well does z linearly predict the random
+    features'. Score = 1/2 log2 det(I + eta W W^T) via the small (d x d) form (Sylvester),
+    so stacking many target features stays cheap. This encodes 'z is linearly sufficient
+    for the random targets', i.e. 'for any random y, regression from z is meaningful'.
+    """
+    z = (z - z.mean(0)).double()
+    h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
+    ztz = z.T @ z + lam * torch.eye(z.shape[1], dtype=z.dtype, device=z.device)
+    w = torch.linalg.solve(ztz, z.T @ h)                 # [d, feat]
+    eye = torch.eye(w.shape[0], dtype=w.dtype, device=w.device)
+    return 0.5 * torch.linalg.slogdet(eye + eta * w @ w.T)[1] / math.log(2)
+
+
+def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack"):
+    """Score of embedding z (differentiable) against a frozen reservoir's view of x.
+
+    direction: 'feat2z' (features->z, the original) or 'z2feat' (z->features, the reframe).
+    multi_agg: if the reservoir returns a list of K feature sets (multi_random),
+               'stack' concatenates them into one score; 'mean' averages K scores.
+    """
     with torch.no_grad():
-        a = ridge_map(reservoir(x))
-    return score(z, a)
+        feats = reservoir(x)
+    feats_list = feats if isinstance(feats, (list, tuple)) else [feats]
+
+    def one(h):
+        if direction == "z2feat":
+            return score_z2feat(z, h)
+        return score(z, ridge_map(h))
+
+    if multi_agg == "mean":
+        return torch.stack([one(h) for h in feats_list]).mean()
+    # stack: concat features along the feature dim, single score
+    h = torch.cat(feats_list, dim=1) if len(feats_list) > 1 else feats_list[0]
+    return one(h)
