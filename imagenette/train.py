@@ -127,6 +127,9 @@ def main():
                    help="for multi_random: stack (concat->one log-det), mean (avg K scores), "
                         "max (soft worst-case min-max over rulers, see --softmin_tau)")
     p.add_argument("--softmin_tau", type=float, default=0.5, help="temperature for multi_agg=max (soft-min)")
+    p.add_argument("--kernel_family", choices=["rbf", "mixed"], default="rbf",
+                   help="multi_rff diversity: rbf (K bandwidths of one RBF kernel) or "
+                        "mixed (K different kernel families: RBF/Laplacian/Cauchy/Matern)")
     p.add_argument("--K", type=int, default=4, help="number of random CNNs for multi_random")
     p.add_argument("--drift_alpha", type=float, default=0.1, help="OU drift rate for random_drift (per epoch)")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
@@ -164,7 +167,9 @@ def main():
         elif a.reservoir == "multi_random":
             reservoir = MultiReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
         elif a.reservoir == "multi_rff":
-            reservoir = MultiRFFReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
+            smults = (1.0,) * a.K if a.kernel_family == "mixed" else (0.5, 1.0, 2.0, 4.0)[:a.K]
+            reservoir = MultiRFFReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS,
+                                          sigma_mults=smults, kernel_family=a.kernel_family).cuda().eval()
         else:  # random, random_resample, random_drift
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
@@ -260,7 +265,8 @@ def main():
     best = max(h["test_acc"] for h in hist)
     res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
                                    embed_bn=a.embed_bn, direction=a.direction, multi_agg=a.multi_agg,
-                                   softmin_tau=a.softmin_tau, K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
+                                   softmin_tau=a.softmin_tau, kernel_family=a.kernel_family,
+                                   K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
                                    epochs=a.epochs, history=hist), indent=1))
     print(f"FINAL {a.method} lamb={a.lamb:g} seed={a.seed}: final {hist[-1]['test_acc'] * 100:.2f}%  best {best * 100:.2f}%", flush=True)
 

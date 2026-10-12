@@ -89,7 +89,16 @@ if __name__ == "__main__":
         z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
         s = epiplexity(z, xm, mrff, direction="z2feat", multi_agg=agg); s.backward()
         assert torch.isfinite(s) and z.grad is not None
-        print(f"      multi_rff({agg}): score={float(s):8.4f} grad_ok=True")
+        print(f"      multi_rff/rbf({agg}): score={float(s):8.4f} grad_ok=True")
+
+    # mixed kernel-family bank
+    mrff_mix = MultiRFFReservoir(WIDTH, 4000, K=4, channels=(16, 32, 64, 64, 128, 128),
+                                 sigma_mults=(1.0, 1.0, 1.0, 1.0), kernel_family="mixed").to(DEVICE)
+    for agg in ("stack", "mean", "max"):
+        z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
+        s = epiplexity(z, xm, mrff_mix, direction="z2feat", multi_agg=agg); s.backward()
+        assert torch.isfinite(s) and z.grad is not None
+        print(f"      multi_rff/mixed({agg}): score={float(s):8.4f} grad_ok=True")
 
     # direction flip z2feat on a single random ruler
     r2 = Reservoir(WIDTH, 4000, (16, 32, 64, 64, 128, 128)).to(DEVICE)

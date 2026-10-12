@@ -184,38 +184,69 @@ class MultiReservoir(nn.Module):
 
 
 class MultiRFFReservoir(nn.Module):
-    """A DIVERSE bank of K Random-Fourier-Feature rulers, each a DIFFERENT RBF kernel
-    (different bandwidth sigma), all on a shared frozen random-CNN descriptor.
+    """A DIVERSE bank of K Random-Fourier-Feature rulers on a shared frozen random-CNN
+    descriptor. Two diversity modes:
 
-    Different bandwidths = different length-scales = complementary blind spots: small
-    sigma sees fine/local structure, large sigma sees smooth/global structure. This is the
-    diversity that makes a min-max (worst-case) aggregation meaningful -- unlike iid CNNs
-    which share one kernel. Bandwidths are scaled by the median pairwise distance of the
-    descriptor (median heuristic) so every kernel is in-regime and the soft-min cannot
-    degenerate onto a mis-scaled ruler. Returns a LIST of K feature sets.
+    - kernel_family='rbf'  (default): K RBF kernels at DIFFERENT bandwidths (Gaussian
+      omega / sigma). Different length-scales -> local<->global blind spots.
+    - kernel_family='mixed': K DIFFERENT kernel families, one per ruler, by sampling omega
+      from different spectral densities (Bochner duality):
+        RBF        <- Gaussian(omega)        (smooth)
+        Laplacian  <- Cauchy/standard-Cauchy (heavy tail -> spiky, local)
+        Cauchy     <- Laplace(omega)         (exponential spectrum)
+        Matern-1/2 <- Student-t(omega)       (intermediate roughness)
+      Different families = different *shapes* of similarity, a stronger notion of diverse
+      blind spots than bandwidth alone.
+
+    All bandwidths/scales use the median pairwise distance (median heuristic) so every
+    kernel is in-regime and a min-max soft-min cannot degenerate onto a mis-scaled ruler.
+    Returns a LIST of K feature sets.
     """
 
-    def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64), sigma_mults=(0.5, 1.0, 2.0, 4.0)):
+    def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64),
+                 sigma_mults=(0.5, 1.0, 2.0, 4.0), kernel_family="rbf"):
         super().__init__()
         assert len(sigma_mults) == K, "need one sigma multiplier per ruler"
         self.backbone = Reservoir(width, seed, channels)   # shared random-CNN descriptor
         self.sigma_mults = sigma_mults
+        self.kernel_family = kernel_family
         self.D = width
+        families = ["rbf", "laplacian", "cauchy", "matern"]
         with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
             torch.manual_seed(seed + 1)
-            # one base random projection + phase per ruler (bandwidth applied at forward)
-            self.register_buffer("omega", torch.randn(K, width, width))   # [K, width, D]
+            omegas = []
+            for k in range(K):
+                if kernel_family == "mixed":
+                    fam = families[k % len(families)]
+                    omegas.append(self._sample_omega(fam, width))
+                else:  # rbf: all Gaussian, bandwidth varied at forward
+                    omegas.append(torch.randn(width, width))
+            self.register_buffer("omega", torch.stack(omegas))            # [K, width, D]
             self.register_buffer("bias", torch.rand(K, width) * 2 * math.pi)
         self.requires_grad_(False)
 
+    @staticmethod
+    def _sample_omega(family, width):
+        """Spectral density whose Fourier dual is the named kernel (Bochner)."""
+        if family == "rbf":            # Gaussian spectrum
+            return torch.randn(width, width)
+        if family == "laplacian":      # standard Cauchy spectrum (heavy tails)
+            return torch.distributions.Cauchy(0.0, 1.0).sample((width, width))
+        if family == "cauchy":         # Laplace/exponential spectrum
+            return torch.distributions.Laplace(0.0, 1.0).sample((width, width))
+        if family == "matern":         # Student-t (df=3) spectrum, intermediate roughness
+            return torch.distributions.StudentT(3.0).sample((width, width))
+        raise ValueError(family)
+
     def forward(self, x):
         u = self.backbone(x)                                   # [N, width]
-        # median pairwise distance (median heuristic) for scale, per batch
         with torch.no_grad():
             d = torch.cdist(u, u)
             med = d[d > 0].median().clamp_min(1e-6)
         outs = []
         for k, m in enumerate(self.sigma_mults):
+            # for 'mixed', each ruler already has its family's omega; still scale by the
+            # median heuristic (and the per-ruler sigma_mult) to keep all in-regime.
             sigma = m * med
             proj = (u @ self.omega[k]) / sigma + self.bias[k]  # [N, D]
             outs.append(math.sqrt(2.0 / self.D) * torch.cos(proj))
