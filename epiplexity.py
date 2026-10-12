@@ -168,7 +168,11 @@ class RFFReservoir(nn.Module):
 class MultiReservoir(nn.Module):
     """K independent random-CNN reservoirs. Returns a LIST of K feature sets; the score
     aggregates them by 'stack' (concat -> one log-det, rewards diversity) or 'mean'
-    (average K scores -> Monte-Carlo estimate of E_R[S])."""
+    (average K scores -> Monte-Carlo estimate of E_R[S]).
+
+    NOTE: K iid same-arch random CNNs all approximate the SAME NNGP kernel, so their
+    blind spots are redundant -- averaging/stacking just reduces sampling noise around one
+    kernel. For genuinely diverse rulers (different kernels), use MultiRFFReservoir."""
 
     def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64)):
         super().__init__()
@@ -177,6 +181,45 @@ class MultiReservoir(nn.Module):
 
     def forward(self, x):
         return [net(x) for net in self.nets]
+
+
+class MultiRFFReservoir(nn.Module):
+    """A DIVERSE bank of K Random-Fourier-Feature rulers, each a DIFFERENT RBF kernel
+    (different bandwidth sigma), all on a shared frozen random-CNN descriptor.
+
+    Different bandwidths = different length-scales = complementary blind spots: small
+    sigma sees fine/local structure, large sigma sees smooth/global structure. This is the
+    diversity that makes a min-max (worst-case) aggregation meaningful -- unlike iid CNNs
+    which share one kernel. Bandwidths are scaled by the median pairwise distance of the
+    descriptor (median heuristic) so every kernel is in-regime and the soft-min cannot
+    degenerate onto a mis-scaled ruler. Returns a LIST of K feature sets.
+    """
+
+    def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64), sigma_mults=(0.5, 1.0, 2.0, 4.0)):
+        super().__init__()
+        assert len(sigma_mults) == K, "need one sigma multiplier per ruler"
+        self.backbone = Reservoir(width, seed, channels)   # shared random-CNN descriptor
+        self.sigma_mults = sigma_mults
+        self.D = width
+        with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+            torch.manual_seed(seed + 1)
+            # one base random projection + phase per ruler (bandwidth applied at forward)
+            self.register_buffer("omega", torch.randn(K, width, width))   # [K, width, D]
+            self.register_buffer("bias", torch.rand(K, width) * 2 * math.pi)
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        u = self.backbone(x)                                   # [N, width]
+        # median pairwise distance (median heuristic) for scale, per batch
+        with torch.no_grad():
+            d = torch.cdist(u, u)
+            med = d[d > 0].median().clamp_min(1e-6)
+        outs = []
+        for k, m in enumerate(self.sigma_mults):
+            sigma = m * med
+            proj = (u @ self.omega[k]) / sigma + self.bias[k]  # [N, D]
+            outs.append(math.sqrt(2.0 / self.D) * torch.cos(proj))
+        return outs
 
 
 def ridge_map(h, lam=RIDGE):

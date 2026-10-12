@@ -26,7 +26,7 @@ from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
-                        MultiReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, epiplexity)
 
 
 # ---------------------------------------------------------------- theirs, verbatim
@@ -112,7 +112,7 @@ def main():
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
     p.add_argument("--reservoir",
                    choices=["random", "pretrained", "recon_online", "random_resample",
-                            "rff", "multi_random", "random_drift"],
+                            "rff", "multi_random", "multi_rff", "random_drift"],
                    default="random",
                    help="random/pretrained/recon_online/random_resample as before; "
                         "rff: random Fourier features on a random-CNN descriptor; "
@@ -163,6 +163,8 @@ def main():
             reservoir = RFFReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
         elif a.reservoir == "multi_random":
             reservoir = MultiReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
+        elif a.reservoir == "multi_rff":
+            reservoir = MultiRFFReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
         else:  # random, random_resample, random_drift
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
