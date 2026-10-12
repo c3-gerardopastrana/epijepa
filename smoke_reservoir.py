@@ -77,9 +77,9 @@ if __name__ == "__main__":
     # multi_random: stack and mean aggregation both finite & differentiable
     multi = MultiReservoir(WIDTH, 4000, K=4, channels=(16, 32, 64, 64, 128, 128)).to(DEVICE)
     xm = torch.randn(BATCH, 3, 128, 128, device=DEVICE)
-    for agg in ("stack", "mean"):
+    for agg in ("stack", "mean", "max"):
         z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
-        s = epiplexity(z, xm, multi, direction="feat2z", multi_agg=agg); s.backward()
+        s = epiplexity(z, xm, multi, direction="z2feat", multi_agg=agg); s.backward()
         assert torch.isfinite(s) and z.grad is not None
         print(f"      multi_random({agg}): score={float(s):8.4f} grad_ok=True")
 

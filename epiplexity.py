@@ -210,12 +210,17 @@ def score_z2feat(z, h, eta=ETA, lam=RIDGE):
     return 0.5 * torch.linalg.slogdet(eye + eta * w @ w.T)[1] / math.log(2)
 
 
-def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack"):
+def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_tau=0.5):
     """Score of embedding z (differentiable) against a frozen reservoir's view of x.
 
     direction: 'feat2z' (features->z, the original) or 'z2feat' (z->features, the reframe).
-    multi_agg: if the reservoir returns a list of K feature sets (multi_random),
-               'stack' concatenates them into one score; 'mean' averages K scores.
+    multi_agg (when the reservoir returns a list of K feature sets):
+      'stack' concatenates them into one score (joint/union, rewards diversity);
+      'mean'  averages the K scores (average-case, E_R[S]);
+      'max'   soft worst-case over rulers: -tau*logsumexp(-S_k/tau). This is the
+              differentiable min-max objective -- it maximises the WORST ruler's score,
+              so no single random direction can be ignored. softmin_tau->0 is a hard min
+              (sparse gradient); larger tau softens toward the mean.
     """
     with torch.no_grad():
         feats = reservoir(x)
@@ -228,6 +233,12 @@ def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack"):
 
     if multi_agg == "mean":
         return torch.stack([one(h) for h in feats_list]).mean()
+    if multi_agg == "max":
+        scores = torch.stack([one(h) for h in feats_list])
+        if scores.numel() == 1:
+            return scores.squeeze()
+        # soft-min (worst-case) score: differentiable, temperature-controlled
+        return -softmin_tau * torch.logsumexp(-scores / softmin_tau, dim=0)
     # stack: concat features along the feature dim, single score
     h = torch.cat(feats_list, dim=1) if len(feats_list) > 1 else feats_list[0]
     return one(h)

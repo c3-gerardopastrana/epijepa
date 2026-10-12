@@ -121,10 +121,12 @@ def main():
     p.add_argument("--resample_every", type=int, default=2,
                    help="for random_resample: epochs between fresh-random reservoir redraws")
     p.add_argument("--recon_lr", type=float, default=1e-3, help="for recon_online: ruler reconstruction LR")
-    p.add_argument("--direction", choices=["feat2z", "z2feat"], default="feat2z",
-                   help="feat2z: features->z (original); z2feat: z->features (linear-sufficiency reframe)")
-    p.add_argument("--multi_agg", choices=["stack", "mean"], default="stack",
-                   help="for multi_random: stack (concat->one log-det) or mean (avg K scores)")
+    p.add_argument("--direction", choices=["feat2z", "z2feat"], default="z2feat",
+                   help="z2feat (default): z->features (linear-sufficiency reframe); feat2z: original")
+    p.add_argument("--multi_agg", choices=["stack", "mean", "max"], default="stack",
+                   help="for multi_random: stack (concat->one log-det), mean (avg K scores), "
+                        "max (soft worst-case min-max over rulers, see --softmin_tau)")
+    p.add_argument("--softmin_tau", type=float, default=0.5, help="temperature for multi_agg=max (soft-min)")
     p.add_argument("--K", type=int, default=4, help="number of random CNNs for multi_random")
     p.add_argument("--drift_alpha", type=float, default=0.1, help="OU drift rate for random_drift (per epoch)")
     p.add_argument("--workers", type=int, default=8); p.add_argument("--grad_ckpt", action="store_true")
@@ -174,7 +176,8 @@ def main():
 
     def views_score(proj, vs):
         return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir,
-                                       direction=a.direction, multi_agg=a.multi_agg)
+                                       direction=a.direction, multi_agg=a.multi_agg,
+                                       softmin_tau=a.softmin_tau)
                             for v in range(a.V)]).mean()
 
     def calibrate_s0():
@@ -255,7 +258,7 @@ def main():
     best = max(h["test_acc"] for h in hist)
     res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
                                    embed_bn=a.embed_bn, direction=a.direction, multi_agg=a.multi_agg,
-                                   K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
+                                   softmin_tau=a.softmin_tau, K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
                                    epochs=a.epochs, history=hist), indent=1))
     print(f"FINAL {a.method} lamb={a.lamb:g} seed={a.seed}: final {hist[-1]['test_acc'] * 100:.2f}%  best {best * 100:.2f}%", flush=True)
 
