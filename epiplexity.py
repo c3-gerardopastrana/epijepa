@@ -253,6 +253,36 @@ class MultiRFFReservoir(nn.Module):
         return outs
 
 
+class MinMaxReservoir(nn.Module):
+    """Faithful max-min objective: on EVERY forward, draw a FRESH family of K random
+    reservoirs (new seeds from an internal step counter) and return their K feature sets.
+
+    Paired with multi_agg='max' (soft-min), this implements  max_z min_R S(z; R)  with the
+    inner min ranging over the *distribution* of random observers -- not 4 frozen rulers.
+    Because the family is resampled each step, the worst-case ruler changes as z improves,
+    so the 'min' is a genuine moving worst-case (an adversary sampled from the family),
+    fixing the static-adversary limitation of a fixed MultiReservoir.
+
+    Encoder-independent: seeds depend only on the step counter, never on z -> no collusion.
+    All reservoirs are frozen (no_grad); gradients flow only through z in the score.
+    """
+
+    def __init__(self, width, seed, K=4, channels=(16, 32, 64, 64)):
+        super().__init__()
+        self.width, self.base_seed, self.K, self.channels = width, seed, K, channels
+        self._step = 0
+
+    def forward(self, x):
+        # fresh family each call (each forward = one step); built directly on x's device
+        nets = [Reservoir(self.width, self.base_seed + 1000 * self._step + k, self.channels).to(x.device).eval()
+                for k in range(self.K)]
+        for n in nets:
+            n.requires_grad_(False)
+        self._step += 1
+        with torch.no_grad():
+            return [n(x) for n in nets]
+
+
 def ridge_map(h, lam=RIDGE):
     """(H^T H + lam I)^-1 H^T on standardised features, via QR. Shape [features, batch]."""
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()

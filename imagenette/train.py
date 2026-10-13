@@ -26,7 +26,24 @@ from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
-                        MultiReservoir, MultiRFFReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, epiplexity)
+
+
+def effective_rank(feats):
+    """Entropy-based effective rank of a feature matrix [N, D] (collapse canary).
+
+    erank = exp(H(p)), p = normalised eigenvalues of the centred covariance. erank=1 means
+    rank-one (collapsed); erank=D means isotropic/full use of all directions."""
+    import torch as _t
+    x = feats - feats.mean(0, keepdim=True)
+    cov = (x.T @ x) / max(x.shape[0] - 1, 1)
+    ev = _t.linalg.eigvalsh(cov.double()).clamp_min(0)
+    s = ev.sum()
+    if s <= 0:
+        return 1.0
+    p = ev / s
+    p = p[p > 0]
+    return float(_t.exp(-(p * p.log()).sum()))
 
 
 # ---------------------------------------------------------------- theirs, verbatim
@@ -112,7 +129,7 @@ def main():
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
     p.add_argument("--reservoir",
                    choices=["random", "pretrained", "recon_online", "random_resample",
-                            "rff", "multi_random", "multi_rff", "random_drift"],
+                            "rff", "multi_random", "multi_rff", "random_drift", "minmax_random"],
                    default="random",
                    help="random/pretrained/recon_online/random_resample as before; "
                         "rff: random Fourier features on a random-CNN descriptor; "
@@ -170,6 +187,8 @@ def main():
             smults = (1.0,) * a.K if a.kernel_family == "mixed" else (0.5, 1.0, 2.0, 4.0)[:a.K]
             reservoir = MultiRFFReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS,
                                           sigma_mults=smults, kernel_family=a.kernel_family).cuda().eval()
+        elif a.reservoir == "minmax_random":
+            reservoir = MinMaxReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda()
         else:  # random, random_resample, random_drift
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
@@ -246,11 +265,18 @@ def main():
                 agg[k] = agg.get(k, 0.) + float(v.detach())
         log = {k: v / len(train) for k, v in agg.items()}
         net.eval(); probe.eval(); correct = 0
+        emb_chunks = []
         with torch.inference_mode():
             for vs, y in test:
                 with autocast("cuda", dtype=torch.bfloat16):
-                    correct += (probe(net(vs.cuda(non_blocking=True))[0]).argmax(1) == y.cuda()).sum().item()
-        log.update(epoch=epoch + 1, test_acc=correct / len(test_ds), seconds=time.perf_counter() - t0)
+                    e = net(vs.cuda(non_blocking=True))[0]
+                    correct += (probe(e).argmax(1) == y.cuda()).sum().item()
+                emb_chunks.append(e.float().cpu())
+        erank = effective_rank(torch.cat(emb_chunks))
+        # raw (un-normalised) epiplexity score S for the epi arms, as a mechanism signal
+        raw_s = -log.get("reg", 0.0) * s0 if a.method == "epi" else 0.0
+        log.update(epoch=epoch + 1, test_acc=correct / len(test_ds),
+                   erank=erank, raw_s=raw_s, seconds=time.perf_counter() - t0)
         hist.append(log)
         ckpt = dict(net=net.state_dict(), probe=probe.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
                     scaler=scaler.state_dict(), epoch=epoch + 1, hist=hist, s0=s0)
@@ -261,7 +287,7 @@ def main():
         torch.save(ckpt, ck)
         (out / "history.json").write_text(json.dumps(hist))
         print(f"{a.method} lamb={a.lamb:g} seed={a.seed}: {epoch + 1}/{a.epochs} acc={log['test_acc'] * 100:.2f}% "
-              f"inv={log['inv']:.4f} reg={log['reg']:.4f} {log['seconds']:.0f}s", flush=True)
+              f"inv={log['inv']:.4f} reg={log['reg']:.4f} erank={log['erank']:.1f} {log['seconds']:.0f}s", flush=True)
     best = max(h["test_acc"] for h in hist)
     res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
                                    embed_bn=a.embed_bn, direction=a.direction, multi_agg=a.multi_agg,

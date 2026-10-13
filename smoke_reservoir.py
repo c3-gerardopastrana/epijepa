@@ -14,7 +14,7 @@ Run:  python smoke_reservoir.py
 import torch
 
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,
-                        MultiReservoir, MultiRFFReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, epiplexity)
 
 DEVICE = "cpu"  # ridge/score run in float64; MPS lacks float64, real training uses CUDA
 WIDTH, PROJ_DIM, BATCH = 64, 16, 32
@@ -107,6 +107,15 @@ if __name__ == "__main__":
     zc = torch.ones(BATCH, PROJ_DIM, device=DEVICE)
     collapsed = float(epiplexity(zc, xm, r2, direction="z2feat"))
     assert torch.isfinite(s) and abs(collapsed) < 1e-3, f"z2feat: collapse should be 0, got {collapsed}"
-    print(f"      z2feat direction: informative={float(s):8.4f} collapsed={collapsed:8.4f} grad_ok=True")
+
+    # MinMaxReservoir: fresh family each forward + worst-case (max) aggregation
+    mm = MinMaxReservoir(WIDTH, 4000, K=4, channels=(16, 32, 64, 64, 128, 128)).to(DEVICE)
+    with torch.no_grad():
+        f1 = mm(xm); f2 = mm(xm)
+    changed = (f1[0] - f2[0]).abs().max().item() > 1e-6
+    z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
+    s = epiplexity(z, xm, mm, direction="z2feat", multi_agg="max"); s.backward()
+    assert torch.isfinite(s) and z.grad is not None
+    print(f"      minmax_random(max): score={float(s):8.4f} family_resampled={changed} grad_ok=True")
 
     print("OK: all reservoirs satisfy the score contract.")
