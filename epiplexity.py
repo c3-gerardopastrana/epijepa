@@ -283,6 +283,50 @@ class MinMaxReservoir(nn.Module):
             return [n(x) for n in nets]
 
 
+class MultiScaleReservoir(nn.Module):
+    """K observers that pool a shared random conv feature map to K DIFFERENT spatial grids
+    (e.g. 1x1 global -> 8x8 local), each with its own random linear readout to `width`.
+
+    Unlike iid random CNNs (which all approximate the SAME NNGP kernel -> redundant blind
+    spots), these observers differ in the *scale of structure* they expose: the 1x1 pool
+    sees global layout, the 8x8 pool sees local detail. This gives the min-max a family
+    with genuinely complementary blind spots -- the diversity that was missing.
+
+    resample=True re-draws the conv + readouts every forward (for the dynamic max-min);
+    seeds depend only on a step counter, never on z (encoder-independent, no collusion).
+    """
+
+    def __init__(self, width, seed, grids=(1, 2, 4, 8), channels=(16, 32, 64, 64), resample=False):
+        super().__init__()
+        self.width, self.base_seed, self.grids, self.channels = width, seed, grids, channels
+        self.resample = resample
+        self._step = 0
+        self._build(seed)
+
+    def _build(self, seed):
+        with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+            torch.manual_seed(seed)
+            layers, inc = [], 3
+            for i, c in enumerate(self.channels):
+                layers += [nn.Conv2d(inc, c, 3, 1 if i == 0 else 2, 1), ChannelNorm(), nn.ELU()]
+                inc = c
+            self.backbone = nn.Sequential(*layers)
+            self.pools = nn.ModuleList([nn.AdaptiveAvgPool2d(g) for g in self.grids])
+            self.readouts = nn.ModuleList(
+                [nn.Linear(self.channels[-1] * g * g, self.width) for g in self.grids])
+        self.requires_grad_(False)
+        self.eval()
+
+    def forward(self, x):
+        if self.resample:
+            self._build(self.base_seed + 1000 * self._step)
+            self._step += 1
+            if x.is_cuda:
+                self.cuda()
+        fmap = self.backbone(x)
+        return [ro(p(fmap).flatten(1)) for p, ro in zip(self.pools, self.readouts)]
+
+
 def ridge_map(h, lam=RIDGE):
     """(H^T H + lam I)^-1 H^T on standardised features, via QR. Shape [features, batch]."""
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()

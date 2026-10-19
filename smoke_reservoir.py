@@ -14,7 +14,7 @@ Run:  python smoke_reservoir.py
 import torch
 
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,
-                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir, epiplexity)
 
 DEVICE = "cpu"  # ridge/score run in float64; MPS lacks float64, real training uses CUDA
 WIDTH, PROJ_DIM, BATCH = 64, 16, 32
@@ -117,5 +117,25 @@ if __name__ == "__main__":
     s = epiplexity(z, xm, mm, direction="z2feat", multi_agg="max"); s.backward()
     assert torch.isfinite(s) and z.grad is not None
     print(f"      minmax_random(max): score={float(s):8.4f} family_resampled={changed} grad_ok=True")
+
+    # MultiScaleReservoir: K observers at different pooling grids (genuinely diverse y's)
+    ms = MultiScaleReservoir(WIDTH, 4000, grids=(1, 2, 4, 8), channels=(16, 32, 64, 64, 128, 128)).to(DEVICE)
+    with torch.no_grad():
+        ys = ms(xm)
+    # the K y's should differ from each other (different scales), not be near-duplicates
+    d01 = (ys[0] - ys[1]).abs().mean().item()
+    for agg in ("mean", "max"):
+        z = torch.randn(BATCH, PROJ_DIM, device=DEVICE, requires_grad=True)
+        s = epiplexity(z, xm, ms, direction="z2feat", multi_agg=agg); s.backward()
+        assert torch.isfinite(s) and z.grad is not None
+        print(f"      multiscale({agg}): score={float(s):8.4f} y0-y1_diff={d01:.3f} grad_ok=True")
+
+    # resampling variant for the dynamic max-min
+    msmm = MultiScaleReservoir(WIDTH, 4000, grids=(1, 2, 4, 8),
+                               channels=(16, 32, 64, 64, 128, 128), resample=True).to(DEVICE)
+    with torch.no_grad():
+        a1 = msmm(xm); a2 = msmm(xm)
+    changed_ms = (a1[0] - a2[0]).abs().max().item() > 1e-6
+    print(f"      multiscale_minmax: family_resampled={changed_ms}")
 
     print("OK: all reservoirs satisfy the score contract.")

@@ -26,7 +26,7 @@ from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
-                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir, epiplexity)
 
 
 def effective_rank(feats):
@@ -129,7 +129,8 @@ def main():
     p.add_argument("--width", type=int, default=64, help="reservoir output width")
     p.add_argument("--reservoir",
                    choices=["random", "pretrained", "recon_online", "random_resample",
-                            "rff", "multi_random", "multi_rff", "random_drift", "minmax_random"],
+                            "rff", "multi_random", "multi_rff", "random_drift", "minmax_random",
+                            "multiscale", "multiscale_minmax"],
                    default="random",
                    help="random/pretrained/recon_online/random_resample as before; "
                         "rff: random Fourier features on a random-CNN descriptor; "
@@ -189,6 +190,11 @@ def main():
                                           sigma_mults=smults, kernel_family=a.kernel_family).cuda().eval()
         elif a.reservoir == "minmax_random":
             reservoir = MinMaxReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda()
+        elif a.reservoir in ("multiscale", "multiscale_minmax"):
+            grids = (1, 2, 4, 8, 16, 3, 6, 12)[:a.K]  # distinct pooling scales, one per observer
+            reservoir = MultiScaleReservoir(a.width, 4000 + a.seed, grids=grids,
+                                            channels=RESERVOIR_CHANNELS,
+                                            resample=(a.reservoir == "multiscale_minmax")).cuda()
         else:  # random, random_resample, random_drift
             reservoir = Reservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
     else:
