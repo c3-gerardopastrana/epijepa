@@ -118,6 +118,16 @@ if __name__ == "__main__":
     assert torch.isfinite(s) and z.grad is not None
     print(f"      minmax_random(max): score={float(s):8.4f} family_resampled={changed} grad_ok=True")
 
+    # batched z2feat must match the per-ruler loop (correctness of the compute optimisation)
+    from epiplexity import score_z2feat, score_z2feat_batched
+    zc2 = torch.randn(BATCH, PROJ_DIM, device=DEVICE)
+    hs = [torch.randn(BATCH, WIDTH, device=DEVICE) for _ in range(4)]
+    loop = torch.stack([score_z2feat(zc2, h) for h in hs])
+    batched = score_z2feat_batched(zc2, hs)
+    maxerr = (loop - batched).abs().max().item()
+    print(f"      batched==loop: max_abs_err={maxerr:.2e} (should be ~0)")
+    assert maxerr < 1e-6, f"batched z2feat disagrees with loop: {maxerr}"
+
     # MultiScaleReservoir: K observers at different pooling grids (genuinely diverse y's)
     ms = MultiScaleReservoir(WIDTH, 4000, grids=(1, 2, 4, 8), channels=(16, 32, 64, 64, 128, 128)).to(DEVICE)
     with torch.no_grad():

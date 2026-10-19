@@ -271,16 +271,18 @@ class MinMaxReservoir(nn.Module):
         super().__init__()
         self.width, self.base_seed, self.K, self.channels = width, seed, K, channels
         self._step = 0
+        # build the K reservoirs ONCE; each forward reseeds them in place (cheap) rather
+        # than reconstructing new modules + moving to GPU (the old, expensive path).
+        self.nets = nn.ModuleList([Reservoir(width, seed + k, channels) for k in range(K)])
+        self.requires_grad_(False)
 
     def forward(self, x):
-        # fresh family each call (each forward = one step); built directly on x's device
-        nets = [Reservoir(self.width, self.base_seed + 1000 * self._step + k, self.channels).to(x.device).eval()
-                for k in range(self.K)]
-        for n in nets:
-            n.requires_grad_(False)
+        # fresh family each call via in-place reseed (no module construction / device moves)
+        for k, n in enumerate(self.nets):
+            n.reseed(self.base_seed + 1000 * self._step + k)
         self._step += 1
         with torch.no_grad():
-            return [n(x) for n in nets]
+            return [n(x) for n in self.nets]
 
 
 class MultiScaleReservoir(nn.Module):
@@ -358,6 +360,24 @@ def score_z2feat(z, h, eta=ETA, lam=RIDGE):
     return 0.5 * torch.linalg.slogdet(eye + eta * w @ w.T)[1] / math.log(2)
 
 
+def score_z2feat_batched(z, hs, eta=ETA, lam=RIDGE):
+    """Batched z2feat: K per-ruler scores in ONE batched solve + slogdet (no Python loop).
+
+    hs: list of K target feature matrices, each [N, m]. Returns a length-K tensor of scores.
+    The K ridge solves (Z^T Z + rho I)^-1 Z^T H_k share the SAME d x d system, so we solve
+    the shared system once and batch only the K right-hand sides; the K log-dets are a single
+    batched slogdet over a [K, d, d] stack. This makes K add negligible wall-clock vs K=1."""
+    z = (z - z.mean(0)).double()
+    H = torch.stack([((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6)
+                      / math.sqrt(h.shape[1])).double() for h in hs])      # [K, N, m]
+    ztz = z.T @ z + lam * torch.eye(z.shape[1], dtype=z.dtype, device=z.device)  # [d, d] shared
+    rhs = torch.einsum("dn,knm->kdm", z.T, H)                              # [K, d, m]
+    w = torch.linalg.solve(ztz, rhs)                                       # [K, d, m] (shared LHS)
+    eye = torch.eye(w.shape[1], dtype=w.dtype, device=w.device)
+    gram = eye + eta * torch.einsum("kdm,kem->kde", w, w)                  # [K, d, d]
+    return 0.5 * torch.linalg.slogdet(gram)[1] / math.log(2)               # [K]
+
+
 def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_tau=0.5):
     """Score of embedding z (differentiable) against a frozen reservoir's view of x.
 
@@ -378,6 +398,13 @@ def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_t
         if direction == "z2feat":
             return score_z2feat(z, h)
         return score(z, ridge_map(h))
+
+    # z2feat mean/max with K>1: batch the K solves+slogdets into one op (K adds ~no cost)
+    if direction == "z2feat" and multi_agg in ("mean", "max") and len(feats_list) > 1:
+        scores = score_z2feat_batched(z, feats_list)      # [K]
+        if multi_agg == "mean":
+            return scores.mean()
+        return -softmin_tau * torch.logsumexp(-scores / softmin_tau, dim=0)
 
     if multi_agg == "mean":
         return torch.stack([one(h) for h in feats_list]).mean()
