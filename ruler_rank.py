@@ -19,14 +19,58 @@ RES_CH = (16, 32, 64, 64, 128, 128)
 
 
 def erank(feats):
-    x = feats - feats.mean(0, keepdim=True)
-    cov = (x.T @ x) / max(x.shape[0] - 1, 1)
-    ev = torch.linalg.eigvalsh(cov.double()).clamp_min(0)
+    ev = _cov_eigs(feats)
     s = ev.sum()
     if s <= 0:
         return 1.0
     p = (ev / s); p = p[p > 0]
     return float(torch.exp(-(p * p.log()).sum()))
+
+
+def _cov_eigs(feats):
+    x = feats - feats.mean(0, keepdim=True)
+    cov = (x.T @ x) / max(x.shape[0] - 1, 1)
+    return torch.linalg.eigvalsh(cov.double()).clamp_min(0)
+
+
+def flatness(feats):
+    """How flat is the covariance spectrum? Returns (erank/dim, top/median eig ratio).
+    erank/dim -> 1.0 means perfectly isotropic (flat); large top/median means concentrated."""
+    ev = _cov_eigs(feats)
+    ev = ev[ev > 1e-12]
+    if ev.numel() == 0:
+        return 0.0, float("inf")
+    s = ev / ev.sum(); s = s[s > 0]
+    er = float(torch.exp(-(s * s.log()).sum()))
+    med = ev.median()
+    return er / feats.shape[1], float(ev.max() / med) if med > 0 else float("inf")
+
+
+class OrthoLinear(torch.nn.Module):
+    """Dense random-linear ruler with ORTHONORMALISED rows (Gaussian -> QR). Flat spectrum
+    by construction; tests the 'orthonormal maximises effective rank' claim."""
+    def __init__(self, m, seed, in_dim=3 * 128 * 128):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        R = torch.randn(in_dim, m, generator=g)        # [D, m]
+        Q, _ = torch.linalg.qr(R, mode="reduced")      # [D, m] orthonormal columns
+        self.register_buffer("Q", Q.T.contiguous())    # [m, D]
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        return x.flatten(1) @ self.Q.T
+
+
+class DenseLinear(torch.nn.Module):
+    """Dense i.i.d. Gaussian random-linear ruler (baseline for the ortho comparison)."""
+    def __init__(self, m, seed, in_dim=3 * 128 * 128):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.register_buffer("R", torch.randn(m, in_dim, generator=g) / math.sqrt(in_dim))
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        return x.flatten(1) @ self.R.T
 
 
 def get_batch(data, n=256, dev="cpu"):
@@ -52,23 +96,23 @@ def main():
     x = get_batch(a.data, dev=dev)
     W = a.width
     rulers = {
-        "random_cnn":        Reservoir(W, 4000, RES_CH),
-        "rff":               RFFReservoir(W, 4000, RES_CH),
+        "random_cnn":          Reservoir(W, 4000, RES_CH),
+        "rff":                 RFFReservoir(W, 4000, RES_CH),
         "multiscale(1,2,4,8)": MultiScaleReservoir(W, 4000, grids=(1, 2, 4, 8), channels=RES_CH),
-        "random_linear":     RandomLinearReservoir(W, 4000, structured=True),
+        "random_linear(SRHT)": RandomLinearReservoir(W, 4000, structured=True),
+        "linear_dense_gauss":  DenseLinear(W, 4000),
+        "linear_ortho(QR)":    OrthoLinear(W, 4000),
     }
     print(f"batch={x.shape[0]}  width={W}  device={dev}")
-    print(f"{'ruler':22}{'rank(H)':>10}   (max possible = width or batch)")
+    print(f"{'ruler':22}{'rank(H)':>9}{'erank/dim':>11}{'top/med':>10}   (erank/dim->1 = flat spectrum)")
     for name, r in rulers.items():
         r = r.to(dev).eval()
         with torch.no_grad():
             h = r(x)
-        if isinstance(h, (list, tuple)):  # multiscale returns a list; report concat + per-head
-            cat = torch.cat(h, dim=1)
-            print(f"{name:22}{erank(cat):10.1f}   (concat of {len(h)} heads; per-head "
-                  f"{[round(erank(hi),1) for hi in h]})")
-        else:
-            print(f"{name:22}{erank(h):10.1f}")
+        if isinstance(h, (list, tuple)):
+            h = torch.cat(h, dim=1)
+        fd, tm = flatness(h)
+        print(f"{name:22}{erank(h):9.1f}{fd:11.3f}{tm:10.1f}")
 
 
 if __name__ == "__main__":
