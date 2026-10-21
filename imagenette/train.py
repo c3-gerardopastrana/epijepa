@@ -26,7 +26,8 @@ from torchvision.transforms import v2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
-                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir,
+                        RandomLinearReservoir, epiplexity)
 
 
 def effective_rank(feats):
@@ -130,7 +131,7 @@ def main():
     p.add_argument("--reservoir",
                    choices=["random", "pretrained", "recon_online", "random_resample",
                             "rff", "multi_random", "multi_rff", "random_drift", "minmax_random",
-                            "multiscale", "multiscale_minmax"],
+                            "multiscale", "multiscale_minmax", "random_linear"],
                    default="random",
                    help="random/pretrained/recon_online/random_resample as before; "
                         "rff: random Fourier features on a random-CNN descriptor; "
@@ -182,6 +183,8 @@ def main():
             recon_opt = torch.optim.AdamW(reservoir.parameters(), lr=a.recon_lr, weight_decay=1e-4)
         elif a.reservoir == "rff":
             reservoir = RFFReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
+        elif a.reservoir == "random_linear":
+            reservoir = RandomLinearReservoir(a.width, 4000 + a.seed, structured=True).cuda().eval()
         elif a.reservoir == "multi_random":
             reservoir = MultiReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
         elif a.reservoir == "multi_rff":

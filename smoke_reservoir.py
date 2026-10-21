@@ -14,7 +14,8 @@ Run:  python smoke_reservoir.py
 import torch
 
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,
-                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir, epiplexity)
+                        MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir,
+                        RandomLinearReservoir, epiplexity)
 
 DEVICE = "cpu"  # ridge/score run in float64; MPS lacks float64, real training uses CUDA
 WIDTH, PROJ_DIM, BATCH = 64, 16, 32
@@ -147,5 +148,11 @@ if __name__ == "__main__":
         a1 = msmm(xm); a2 = msmm(xm)
     changed_ms = (a1[0] - a2[0]).abs().max().item() > 1e-6
     print(f"      multiscale_minmax: family_resampled={changed_ms}")
+
+    # RandomLinearReservoir: structured (fast) random linear measurement of the image
+    rl = RandomLinearReservoir(WIDTH, 4000, structured=True).to(DEVICE)
+    check("RandomLinear(struct)", rl)
+    rld = RandomLinearReservoir(WIDTH, 4000, structured=False).to(DEVICE)
+    check("RandomLinear(dense)", rld)
 
     print("OK: all reservoirs satisfy the score contract.")

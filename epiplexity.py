@@ -253,6 +253,49 @@ class MultiRFFReservoir(nn.Module):
         return outs
 
 
+class RandomLinearReservoir(nn.Module):
+    """Random LINEAR measurement ruler: y = R vec(x), R a fixed random m x D map.
+
+    Basis-agnostic observer of the image (compressed-sensing / RIP view): with enough rows
+    a random linear map preserves image information in no particular basis, and -- unlike
+    iid random CNNs, which all approximate ONE NNGP kernel -- independent draws of R probe
+    genuinely different random subspaces, giving the diversity a min-max family needs.
+
+    structured=True uses a fast sign-flip + rFFT projection (O(D log D), SRHT-like) instead
+    of a dense O(mD) matmul. resample=True re-draws R every forward (dynamic min-max).
+    """
+
+    def __init__(self, width, seed, in_dim=3 * 128 * 128, structured=True, resample=False):
+        super().__init__()
+        self.m, self.in_dim, self.structured, self.resample = width, in_dim, structured, resample
+        self.seed, self._step = seed, 0
+        self._build(seed)
+
+    def _build(self, seed):
+        g = torch.Generator().manual_seed(seed)
+        if self.structured:
+            # SRHT-like: random sign flip -> rFFT -> random frequency subsample. Cheap.
+            self.register_buffer("signs", (torch.randint(0, 2, (self.in_dim,), generator=g) * 2 - 1).float())
+            freqs = self.in_dim // 2 + 1
+            self.register_buffer("idx", torch.randperm(freqs, generator=g)[: self.m])
+        else:
+            self.register_buffer("R", torch.randn(self.m, self.in_dim, generator=g) / math.sqrt(self.in_dim))
+        self.requires_grad_(False)
+
+    def forward(self, x):
+        if self.resample:
+            self._build(self.seed + 1000 * self._step)
+            if x.is_cuda:
+                self.cuda()
+            self._step += 1
+        xv = x.flatten(1)                                        # [N, D]
+        if self.structured:
+            z = xv * self.signs
+            F = torch.fft.rfft(z, dim=1)                         # [N, D//2+1] complex
+            return F[:, self.idx].real                           # [N, m]
+        return xv @ self.R.T                                     # [N, m]
+
+
 class MinMaxReservoir(nn.Module):
     """Faithful max-min objective: on EVERY forward, draw a FRESH family of K random
     reservoirs (new seeds from an internal step counter) and return their K feature sets.
