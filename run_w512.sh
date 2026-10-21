@@ -1,26 +1,23 @@
 #!/usr/bin/env bash
-# Width-512, 800-epoch comparison, one arm per GPU. Chassis is set PER DIRECTION:
-#   feat2z arms -> --no_embed_bn (the faithful Imagenette chassis; BN hurt feat2z epi)
-#   z2feat arms -> BN on (default; z2feat needs it for embedding-scale control)
-# sigreg auto-disables BN regardless. This fixes the earlier run where BN was on for all.
-# NOTE: the *_nobn z2feat arms test whether z2feat needs the BN at all (lambda=0.1 may let
-# the invariance term restrain scale). They MAY blow up (watch inv -> if it climbs past ~2
-# and keeps rising, that arm is diverging). Divergence is an informative result, not a bug.
+# Width-512, 800-epoch comparison, one arm per GPU (8 arms = 8 GPUs). BN set PER DIRECTION:
+#   feat2z arms -> --no_embed_bn (faithful chassis; BN whitens the ridge TARGET z and hurts)
+#   z2feat arms -> BN on (default; pins the ridge REGRESSOR z's scale, prevents blow-up)
+# sigreg auto-disables BN. Each of drift / rff / random_linear is run BOTH directions.
 #
 # Usage: DATA=data/imagenette2-160 EPOCHS=800 ./run_w512.sh   (needs 8 GPUs)
 set -uo pipefail
 DATA="${DATA:-data/imagenette2-160}"; EPOCHS="${EPOCHS:-800}"; OUT="${OUT:-runs/w512v2}"; W=512
 
-#            name            method  lamb  reservoir       extra (incl. direction + BN)
+#            name                  method  lamb  reservoir       extra (direction + BN)
 rows=(
-  "sigreg          sigreg  0.02  random         "
-  "epiplexity      epi     0.1   random         --direction feat2z --no_embed_bn"
-  "drift           epi     0.1   random_drift   --direction feat2z --no_embed_bn --drift_alpha 0.1"
-  "drift_z2feat    epi     0.1   random_drift   --direction z2feat --drift_alpha 0.1"
-  "random_linear   epi     0.1   random_linear  --direction z2feat"
-  "rff             epi     0.1   rff             --direction z2feat"
-  "random_linear_nobn  epi 0.1   random_linear  --direction z2feat --no_embed_bn"
-  "rff_nobn        epi     0.1   rff             --direction z2feat --no_embed_bn"
+  "sigreg                sigreg  0.02  random         "
+  "epiplexity            epi     0.1   random         --direction feat2z --no_embed_bn"
+  "drift_feat2z          epi     0.1   random_drift   --direction feat2z --no_embed_bn --drift_alpha 0.1"
+  "drift_z2feat          epi     0.1   random_drift   --direction z2feat --drift_alpha 0.1"
+  "rff_feat2z            epi     0.1   rff            --direction feat2z --no_embed_bn"
+  "rff_z2feat            epi     0.1   rff            --direction z2feat"
+  "random_linear_feat2z  epi     0.1   random_linear  --direction feat2z --no_embed_bn"
+  "random_linear_z2feat  epi     0.1   random_linear  --direction z2feat"
 )
 
 gpu=0
