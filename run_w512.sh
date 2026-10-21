@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Width-512 concurrent run: the baselines + best label-free (drift) + random-linear ruler.
-# All 800 epochs, one arm per GPU (no crashes), width=512 (the repo's Imagenette reservoir
-# size -- fixes the earlier under-powered width=64).
+# Width-512, 800-epoch comparison, one arm per GPU. Chassis is set PER DIRECTION:
+#   feat2z arms -> --no_embed_bn (the faithful Imagenette chassis; BN hurt feat2z epi)
+#   z2feat arms -> BN on (default; z2feat needs it for embedding-scale control)
+# sigreg auto-disables BN regardless. This fixes the earlier run where BN was on for all.
 #
 # Usage: DATA=data/imagenette2-160 EPOCHS=800 ./run_w512.sh
 set -uo pipefail
-DATA="${DATA:-data/imagenette2-160}"; EPOCHS="${EPOCHS:-800}"; OUT="${OUT:-runs/w512}"; W=512
+DATA="${DATA:-data/imagenette2-160}"; EPOCHS="${EPOCHS:-800}"; OUT="${OUT:-runs/w512v2}"; W=512
 
-#            name          method  lamb  reservoir       extra
+#            name            method  lamb  reservoir       extra (incl. direction + BN)
 rows=(
   "sigreg          sigreg  0.02  random         "
-  "epiplexity      epi     0.1   random         --direction feat2z"
-  "drift           epi     0.1   random_drift   --direction feat2z --drift_alpha 0.1"
+  "epiplexity      epi     0.1   random         --direction feat2z --no_embed_bn"
+  "drift           epi     0.1   random_drift   --direction feat2z --no_embed_bn --drift_alpha 0.1"
   "drift_z2feat    epi     0.1   random_drift   --direction z2feat --drift_alpha 0.1"
   "random_linear   epi     0.1   random_linear  --direction z2feat"
+  "rff             epi     0.1   rff             --direction z2feat"
 )
 
 gpu=0
