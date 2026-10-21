@@ -3,8 +3,11 @@
 #   feat2z arms -> --no_embed_bn (the faithful Imagenette chassis; BN hurt feat2z epi)
 #   z2feat arms -> BN on (default; z2feat needs it for embedding-scale control)
 # sigreg auto-disables BN regardless. This fixes the earlier run where BN was on for all.
+# NOTE: the *_nobn z2feat arms test whether z2feat needs the BN at all (lambda=0.1 may let
+# the invariance term restrain scale). They MAY blow up (watch inv -> if it climbs past ~2
+# and keeps rising, that arm is diverging). Divergence is an informative result, not a bug.
 #
-# Usage: DATA=data/imagenette2-160 EPOCHS=800 ./run_w512.sh
+# Usage: DATA=data/imagenette2-160 EPOCHS=800 ./run_w512.sh   (needs 8 GPUs)
 set -uo pipefail
 DATA="${DATA:-data/imagenette2-160}"; EPOCHS="${EPOCHS:-800}"; OUT="${OUT:-runs/w512v2}"; W=512
 
@@ -16,6 +19,8 @@ rows=(
   "drift_z2feat    epi     0.1   random_drift   --direction z2feat --drift_alpha 0.1"
   "random_linear   epi     0.1   random_linear  --direction z2feat"
   "rff             epi     0.1   rff             --direction z2feat"
+  "random_linear_nobn  epi 0.1   random_linear  --direction z2feat --no_embed_bn"
+  "rff_nobn        epi     0.1   rff             --direction z2feat --no_embed_bn"
 )
 
 gpu=0
