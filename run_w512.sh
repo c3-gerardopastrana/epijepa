@@ -9,10 +9,11 @@ DATA="${DATA:-data/imagenette2-160}"; EPOCHS="${EPOCHS:-800}"; OUT="${OUT:-runs/
 
 #            name          method  lamb  reservoir       extra
 rows=(
-  "sigreg        sigreg  0.02  random         "
-  "epiplexity    epi     0.1   random         --direction feat2z"
-  "drift         epi     0.1   random_drift   --direction feat2z --drift_alpha 0.1"
-  "random_linear epi     0.1   random_linear  --direction z2feat"
+  "sigreg          sigreg  0.02  random         "
+  "epiplexity      epi     0.1   random         --direction feat2z"
+  "drift           epi     0.1   random_drift   --direction feat2z --drift_alpha 0.1"
+  "drift_z2feat    epi     0.1   random_drift   --direction z2feat --drift_alpha 0.1"
+  "random_linear   epi     0.1   random_linear  --direction z2feat"
 )
 
 gpu=0
