@@ -27,7 +27,7 @@ from torchvision.transforms import v2
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
                         MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir,
-                        RandomLinearReservoir, epiplexity)
+                        RandomLinearReservoir, score_z2feat, epiplexity)
 
 
 def effective_rank(feats):
@@ -149,6 +149,10 @@ def main():
     p.add_argument("--whiten_h", action="store_true",
                    help="whiten (decorrelate) the ruler features H before the ridge/score; tests "
                         "whether a flat ruler spectrum fixes z2feat's low-rank collapse")
+    p.add_argument("--invariant_target", action="store_true",
+                   help="z2feat: regress each view's z against the VIEW-AVERAGED ruler features "
+                        "(random projection of augmentation-invariant content = 'important' y), "
+                        "instead of that view's own raw features")
     p.add_argument("--kernel_family", choices=["rbf", "mixed"], default="rbf",
                    help="multi_rff diversity: rbf (K bandwidths of one RBF kernel) or "
                         "mixed (K different kernel families: RBF/Laplacian/Cauchy/Matern)")
@@ -213,6 +217,13 @@ def main():
     scaler = GradScaler()
 
     def views_score(proj, vs):
+        if a.invariant_target:
+            # target = VIEW-AVERAGED ruler features (invariant content); regress each z_v -> Hbar
+            with torch.no_grad():
+                hs = [reservoir(vs[:, v].float()) for v in range(a.V)]
+                hbar = torch.stack(hs).mean(0)                     # [N, m] invariant target
+            return torch.stack([score_z2feat(proj[v].float(), hbar, whiten=a.whiten_h)
+                                for v in range(a.V)]).mean()
         return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir,
                                        direction=a.direction, multi_agg=a.multi_agg,
                                        softmin_tau=a.softmin_tau, whiten=a.whiten_h)
@@ -304,6 +315,7 @@ def main():
     res.write_text(json.dumps(dict(method=a.method, lamb=a.lamb, seed=a.seed, reservoir=a.reservoir,
                                    embed_bn=a.embed_bn, direction=a.direction, multi_agg=a.multi_agg,
                                    softmin_tau=a.softmin_tau, kernel_family=a.kernel_family,
+                                   invariant_target=a.invariant_target,
                                    K=a.K, final_acc=hist[-1]["test_acc"], best_acc=best,
                                    epochs=a.epochs, history=hist), indent=1))
     print(f"FINAL {a.method} lamb={a.lamb:g} seed={a.seed}: final {hist[-1]['test_acc'] * 100:.2f}%  best {best * 100:.2f}%", flush=True)
