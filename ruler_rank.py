@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from epiplexity import (Reservoir, RFFReservoir, MultiRFFReservoir, MultiScaleReservoir,
-                        RandomLinearReservoir)
+                        RandomLinearReservoir, RandomConvReservoir)
 
 RES_CH = (16, 32, 64, 64, 128, 128)
 
@@ -100,6 +100,7 @@ def main():
         "rff":                 RFFReservoir(W, 4000, RES_CH),
         "multiscale(1,2,4,8)": MultiScaleReservoir(W, 4000, grids=(1, 2, 4, 8), channels=RES_CH),
         "random_linear(SRHT)": RandomLinearReservoir(W, 4000, structured=True),
+        "random_conv(CS)":     RandomConvReservoir(W, 4000),
         "linear_dense_gauss":  DenseLinear(W, 4000),
         "linear_ortho(QR)":    OrthoLinear(W, 4000),
     }

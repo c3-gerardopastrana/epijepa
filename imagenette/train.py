@@ -27,7 +27,7 @@ from torchvision.transforms import v2
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from epiplexity import (Reservoir, PretrainedReservoir, ReconReservoir, RFFReservoir,  # noqa: E402
                         MultiReservoir, MultiRFFReservoir, MinMaxReservoir, MultiScaleReservoir,
-                        RandomLinearReservoir, score_z2feat, epiplexity)
+                        RandomLinearReservoir, RandomConvReservoir, score_z2feat, epiplexity)
 
 
 def effective_rank(feats):
@@ -131,10 +131,13 @@ def main():
     p.add_argument("--reservoir",
                    choices=["random", "pretrained", "recon_online", "random_resample",
                             "rff", "multi_random", "multi_rff", "random_drift", "minmax_random",
-                            "multiscale", "multiscale_minmax", "random_linear"],
+                            "multiscale", "multiscale_minmax", "random_linear", "random_conv"],
                    default="random",
                    help="random/pretrained/recon_online/random_resample as before; "
                         "rff: random Fourier features on a random-CNN descriptor; "
+                        "random_linear: dense/SRHT random-linear CS ruler; "
+                        "random_conv: compressed-sensing random CONVOLUTION (partial-circulant, "
+                        "RIP) with char. nonlinearity + light pooling + orthonormal readout; "
                         "multi_random: K random CNNs (see --K, --multi_agg); "
                         "random_drift: OU slow-drift random CNN (see --drift_alpha)")
     p.add_argument("--resample_every", type=int, default=2,
@@ -192,6 +195,8 @@ def main():
             reservoir = RFFReservoir(a.width, 4000 + a.seed, RESERVOIR_CHANNELS).cuda().eval()
         elif a.reservoir == "random_linear":
             reservoir = RandomLinearReservoir(a.width, 4000 + a.seed, structured=True).cuda().eval()
+        elif a.reservoir == "random_conv":
+            reservoir = RandomConvReservoir(a.width, 4000 + a.seed).cuda().eval()
         elif a.reservoir == "multi_random":
             reservoir = MultiReservoir(a.width, 4000 + a.seed, K=a.K, channels=RESERVOIR_CHANNELS).cuda().eval()
         elif a.reservoir == "multi_rff":

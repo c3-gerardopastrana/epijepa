@@ -296,6 +296,101 @@ class RandomLinearReservoir(nn.Module):
         return xv @ self.R.T                                     # [N, m]
 
 
+class RandomConvReservoir(nn.Module):
+    """Compressed-sensing random CONVOLUTION ruler (the image-correct replacement for the
+    dense Gaussian `RandomLinearReservoir`).
+
+    Rationale (why conv, not dense Gaussian):
+      A random convolution is a random *partial circulant* operator. Partial random
+      circulant matrices satisfy the Restricted Isometry Property (Krahmer-Mendelson-
+      Rauhut 2014; Rauhut 2009), so the exact compressed-sensing guarantee carries over:
+      m = O(k polylog D) random measurements preserve all information in a k-sparse (here
+      k-compressible) signal -- the same "sample enough => keep all the information" that
+      justifies the dense Gaussian -- WHILE additionally respecting the locality and
+      translation symmetry that make natural images compressible in the first place. So it
+      is both a genuine RIP sensing operator AND matched to image structure, which a dense
+      Gaussian ignores.
+
+    Pipeline (each piece maps to a design requirement):
+      1. random conv filters, FROZEN               -> partial-circulant sensing operator
+      2. randomized spatial subsampling            -> the "partial" rows of the circulant
+                                                      (keeps m = #channels * #kept-locations)
+      3. characteristic nonlinearity cos(. + b)     -> richer injective embedding (an
+                                                      unbiased characteristic-function /
+                                                      random-feature lift; preserves info,
+                                                      adds a nonlinear coordinate)
+      4. LIGHT pooling (pool=1 by default)          -> keep full information (heavy pooling
+                                                      throws away the high-freq detail CS
+                                                      is meant to retain)
+      5. orthonormal readout (Gaussian -> QR)       -> flat-spectrum final projection to
+                                                      `width`, maximising effective rank
+
+    Frozen / encoder-independent (no collusion): all weights depend only on `seed`.
+    """
+
+    def __init__(self, width, seed, channels=(64, 128), ksize=9, stride=2,
+                 keep=0.25, pool=1, nonlin="cos"):
+        super().__init__()
+        self.width, self.keep, self.pool, self.nonlin = width, keep, pool, nonlin
+        with torch.random.fork_rng(devices=[0] if torch.cuda.is_available() else []):
+            torch.manual_seed(seed)
+            # (1) random conv stack = random partial-circulant sensing operator. Large
+            # kernels + a couple of strided stages give wide receptive fields while the
+            # convolution structure keeps it translation-equivariant (image-matched).
+            layers, inc = [], 3
+            for i, c in enumerate(channels):
+                layers += [nn.Conv2d(inc, c, ksize, stride if i == 0 else stride, ksize // 2),
+                           ChannelNorm()]
+                inc = c
+            self.conv = nn.Sequential(*layers)
+            self.out_ch = channels[-1]
+            # (3) characteristic-function nonlinearity needs a random phase per channel.
+            self.register_buffer("phase", torch.rand(self.out_ch) * 2 * math.pi)
+            # orthonormal readout is built lazily on the first forward, once we know the
+            # subsampled feature dimension (depends on the input spatial size).
+            self._ortho = None
+            self._seed = seed
+        self.requires_grad_(False)
+        self.eval()
+
+    def _nonlinearity(self, h):
+        if self.nonlin == "cos":                       # characteristic-function lift
+            return math.sqrt(2.0) * torch.cos(h + self.phase.view(1, -1, 1, 1))
+        if self.nonlin == "elu":
+            return F.elu(h)
+        return h                                       # 'none' -> purely linear CS operator
+
+    @torch.no_grad()
+    def _subsample_idx(self, hw, device):
+        """(2) randomized spatial subsampling: keep a random `keep` fraction of the H*W
+        locations (the 'partial' rows of the circulant operator). Deterministic in seed."""
+        g = torch.Generator(device="cpu").manual_seed(self._seed + 7)
+        n_keep = max(int(round(hw * self.keep)), 1)
+        return torch.randperm(hw, generator=g)[:n_keep].to(device)
+
+    @torch.no_grad()
+    def _build_ortho(self, in_dim, device):
+        """(5) orthonormal readout: Gaussian -> QR gives a flat-spectrum m x in_dim map, so
+        the final `width` coordinates are maximally decorrelated (max effective rank)."""
+        g = torch.Generator(device="cpu").manual_seed(self._seed + 11)
+        R = torch.randn(in_dim, self.width, generator=g)       # [in_dim, width]
+        Q, _ = torch.linalg.qr(R, mode="reduced")              # orthonormal columns
+        self._ortho = Q.T.contiguous().to(device)              # [width, in_dim]
+
+    def forward(self, x):
+        h = self.conv(x)                                        # [N, C, H', W']  circulant sense
+        if self.pool > 1:                                       # (4) light pooling (default off)
+            h = F.adaptive_avg_pool2d(h, self.pool)
+        h = self._nonlinearity(h)                               # [N, C, H', W']  char. lift
+        N, C, H, W = h.shape
+        h = h.reshape(N, C, H * W)
+        idx = self._subsample_idx(H * W, h.device)              # (2) partial rows
+        h = h[:, :, idx].reshape(N, -1)                         # [N, C*n_keep]
+        if self._ortho is None or self._ortho.shape[1] != h.shape[1]:
+            self._build_ortho(h.shape[1], h.device)
+        return h @ self._ortho.T                                # [N, width]  flat-spectrum
+
+
 class MinMaxReservoir(nn.Module):
     """Faithful max-min objective: on EVERY forward, draw a FRESH family of K random
     reservoirs (new seeds from an internal step counter) and return their K feature sets.
