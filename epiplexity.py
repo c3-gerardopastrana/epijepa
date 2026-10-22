@@ -372,12 +372,25 @@ class MultiScaleReservoir(nn.Module):
         return [ro(p(fmap).flatten(1)) for p, ro in zip(self.pools, self.readouts)]
 
 
-def ridge_map(h, lam=RIDGE):
+def ridge_map(h, lam=RIDGE, whiten=False):
     """(H^T H + lam I)^-1 H^T on standardised features, via QR. Shape [features, batch]."""
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
+    if whiten:
+        h = _whiten(h)
     aug = torch.cat([h, math.sqrt(lam) * torch.eye(h.shape[1], dtype=h.dtype, device=h.device)])
     q, r = torch.linalg.qr(aug, mode="reduced")
     return torch.linalg.solve_triangular(r, q[: h.shape[0]].T, upper=True)
+
+
+def _whiten(h, eps=1e-4):
+    """Decorrelate columns: H <- H Cov(H)^{-1/2}, so Cov becomes ~I (flat spectrum).
+    Goes beyond per-column standardisation (which only equalises diagonal variances) by
+    removing the off-diagonal correlations that keep H spectrally concentrated."""
+    hc = h - h.mean(0)
+    cov = (hc.T @ hc) / max(hc.shape[0] - 1, 1)
+    ev, U = torch.linalg.eigh(cov + eps * torch.eye(cov.shape[0], dtype=cov.dtype, device=cov.device))
+    inv_sqrt = U @ torch.diag(ev.clamp_min(eps).rsqrt()) @ U.T
+    return hc @ inv_sqrt
 
 
 def score(z, a, eta=ETA):
@@ -387,7 +400,7 @@ def score(z, a, eta=ETA):
     return 0.5 * torch.linalg.slogdet(eye + eta * w.T @ w)[1] / math.log(2)
 
 
-def score_z2feat(z, h, eta=ETA, lam=RIDGE):
+def score_z2feat(z, h, eta=ETA, lam=RIDGE, whiten=False):
     """Flipped direction (Axis D): z is the REGRESSOR, random features h the TARGET.
 
     W = (Z^T Z + rho I)^-1 Z^T H_c  -- 'how well does z linearly predict the random
@@ -397,13 +410,15 @@ def score_z2feat(z, h, eta=ETA, lam=RIDGE):
     """
     z = (z - z.mean(0)).double()
     h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
+    if whiten:
+        h = _whiten(h)
     ztz = z.T @ z + lam * torch.eye(z.shape[1], dtype=z.dtype, device=z.device)
     w = torch.linalg.solve(ztz, z.T @ h)                 # [d, feat]
     eye = torch.eye(w.shape[0], dtype=w.dtype, device=w.device)
     return 0.5 * torch.linalg.slogdet(eye + eta * w @ w.T)[1] / math.log(2)
 
 
-def score_z2feat_batched(z, hs, eta=ETA, lam=RIDGE):
+def score_z2feat_batched(z, hs, eta=ETA, lam=RIDGE, whiten=False):
     """Batched z2feat: K per-ruler scores in ONE batched solve + slogdet (no Python loop).
 
     hs: list of K target feature matrices, each [N, m]. Returns a length-K tensor of scores.
@@ -411,8 +426,10 @@ def score_z2feat_batched(z, hs, eta=ETA, lam=RIDGE):
     the shared system once and batch only the K right-hand sides; the K log-dets are a single
     batched slogdet over a [K, d, d] stack. This makes K add negligible wall-clock vs K=1."""
     z = (z - z.mean(0)).double()
-    H = torch.stack([((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6)
-                      / math.sqrt(h.shape[1])).double() for h in hs])      # [K, N, m]
+    def prep(h):
+        h = ((h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])).double()
+        return _whiten(h) if whiten else h
+    H = torch.stack([prep(h) for h in hs])               # [K, N, m]
     ztz = z.T @ z + lam * torch.eye(z.shape[1], dtype=z.dtype, device=z.device)  # [d, d] shared
     rhs = torch.einsum("dn,knm->kdm", z.T, H)                              # [K, d, m]
     w = torch.linalg.solve(ztz, rhs)                                       # [K, d, m] (shared LHS)
@@ -421,7 +438,7 @@ def score_z2feat_batched(z, hs, eta=ETA, lam=RIDGE):
     return 0.5 * torch.linalg.slogdet(gram)[1] / math.log(2)               # [K]
 
 
-def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_tau=0.5):
+def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_tau=0.5, whiten=False):
     """Score of embedding z (differentiable) against a frozen reservoir's view of x.
 
     direction: 'feat2z' (features->z, the original) or 'z2feat' (z->features, the reframe).
@@ -439,12 +456,12 @@ def epiplexity(z, x, reservoir, direction="feat2z", multi_agg="stack", softmin_t
 
     def one(h):
         if direction == "z2feat":
-            return score_z2feat(z, h)
-        return score(z, ridge_map(h))
+            return score_z2feat(z, h, whiten=whiten)
+        return score(z, ridge_map(h, whiten=whiten))
 
     # z2feat mean/max with K>1: batch the K solves+slogdets into one op (K adds ~no cost)
     if direction == "z2feat" and multi_agg in ("mean", "max") and len(feats_list) > 1:
-        scores = score_z2feat_batched(z, feats_list)      # [K]
+        scores = score_z2feat_batched(z, feats_list, whiten=whiten)      # [K]
         if multi_agg == "mean":
             return scores.mean()
         return -softmin_tau * torch.logsumexp(-scores / softmin_tau, dim=0)

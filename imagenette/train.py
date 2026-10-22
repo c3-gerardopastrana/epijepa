@@ -146,6 +146,9 @@ def main():
                    help="for multi_random: stack (concat->one log-det), mean (avg K scores), "
                         "max (soft worst-case min-max over rulers, see --softmin_tau)")
     p.add_argument("--softmin_tau", type=float, default=0.5, help="temperature for multi_agg=max (soft-min)")
+    p.add_argument("--whiten_h", action="store_true",
+                   help="whiten (decorrelate) the ruler features H before the ridge/score; tests "
+                        "whether a flat ruler spectrum fixes z2feat's low-rank collapse")
     p.add_argument("--kernel_family", choices=["rbf", "mixed"], default="rbf",
                    help="multi_rff diversity: rbf (K bandwidths of one RBF kernel) or "
                         "mixed (K different kernel families: RBF/Laplacian/Cauchy/Matern)")
@@ -212,7 +215,7 @@ def main():
     def views_score(proj, vs):
         return torch.stack([epiplexity(proj[v].float(), vs[:, v].float(), reservoir,
                                        direction=a.direction, multi_agg=a.multi_agg,
-                                       softmin_tau=a.softmin_tau)
+                                       softmin_tau=a.softmin_tau, whiten=a.whiten_h)
                             for v in range(a.V)]).mean()
 
     def calibrate_s0():
