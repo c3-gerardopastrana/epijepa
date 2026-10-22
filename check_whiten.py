@@ -39,7 +39,7 @@ def standardize(h):
     return (h - h.mean(0)) / h.std(0, unbiased=False).clamp_min(1e-6) / math.sqrt(h.shape[1])
 
 
-def get_batch(data, n, dev, bf16):
+def get_batch(data, n, dev):
     from torchvision.datasets import ImageFolder
     from torchvision.transforms import v2
     tf = v2.Compose([v2.Resize(128), v2.CenterCrop(128), v2.ToImage(),
@@ -47,8 +47,7 @@ def get_batch(data, n, dev, bf16):
                      v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
     ds = ImageFolder(Path(data) / "val")
     idx = torch.randperm(len(ds))[:n]
-    x = torch.stack([tf(ds[i][0].convert("RGB")) for i in idx]).to(dev)
-    return x.to(torch.bfloat16) if bf16 else x
+    return torch.stack([tf(ds[i][0].convert("RGB")) for i in idx]).to(dev)
 
 
 def main():
@@ -57,7 +56,7 @@ def main():
     p.add_argument("--bs", type=int, default=256); p.add_argument("--bf16", action="store_true")
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    x = get_batch(a.data, a.bs, dev, a.bf16)
+    x = get_batch(a.data, a.bs, dev)
     W = a.width
     rulers = {
         "random_cnn":    Reservoir(W, 4000, RES_CH),
@@ -65,12 +64,16 @@ def main():
         "random_linear": RandomLinearReservoir(W, 4000, structured=True),
     }
     print(f"batch={a.bs} width={W} bf16={a.bf16} dev={dev}")
-    hdr = f"{'ruler':14}{'stage':12}{'rank':>8}{'rank/dim':>10}{'top/med':>10}"
-    print(hdr)
+    print(f"{'ruler':14}{'stage':12}{'rank':>8}{'rank/dim':>10}{'top/med':>10}")
     for name, r in rulers.items():
         r = r.to(dev).eval()
         with torch.no_grad():
-            h = r(x).float()
+            if a.bf16 and dev == "cuda":
+                with torch.autocast("cuda", dtype=torch.bfloat16):   # match training
+                    h = r(x)
+            else:
+                h = r(x)
+        h = h.float()
         hs = standardize(h)
         hw = _whiten(hs)
         for stage, hh in [("standardized", hs), ("whitened", hw)]:
