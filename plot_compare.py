@@ -64,6 +64,9 @@ def main():
     p.add_argument("paths", nargs="+", help="run dirs, history.json files, or globs")
     p.add_argument("--min-acc", type=float, default=30.0, help="keep arms reaching this test acc %% (default 30)")
     p.add_argument("--min-erank", type=float, default=5.0, help="keep arms reaching this erank (default 5)")
+    p.add_argument("--always", default=None,
+                   help="substring; arms whose label contains it are ALWAYS kept, even if they "
+                        "don't clear the gates (e.g. the currently-running arm: --always randconv)")
     p.add_argument("--smooth", type=int, default=5)
     p.add_argument("--out", default="compare.png")
     a = p.parse_args()
@@ -84,7 +87,8 @@ def main():
         best_acc = max(e["test_acc"] * 100 for e in h)
         best_er = max(e.get("erank", 0) for e in h)
         name = label_for(f, root_parts)
-        if best_acc >= a.min_acc and best_er >= a.min_erank:
+        forced = a.always is not None and a.always in name
+        if forced or (best_acc >= a.min_acc and best_er >= a.min_erank):
             kept.append((name, h, best_acc, best_er))
         else:
             dropped.append((name, best_acc, best_er))
